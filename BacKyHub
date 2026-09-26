@@ -358,9 +358,11 @@ local STAGES = {
     { map = "Samurai Palace", diff = "Insane",    minLvl = 90,  targetLvl = 95  },
     { map = "Samurai Palace", diff = "Nightmare", minLvl = 95,  targetLvl = 100 },
 
-    { map = "The Canals", diff = "Insane",    minLvl = 100, targetLvl = 110 },
+    -- Nối liền: The Canals kéo dài cày từ Lv 100 -> 120
+    { map = "The Canals", diff = "Insane",    minLvl = 100, targetLvl = 105 },
     { map = "The Canals", diff = "Nightmare", minLvl = 110, targetLvl = 120 },
 
+    -- Nhảy thẳng sang Steampunk Sewers khi đạt Lv 120 (Bỏ qua hoàn toàn Ghastly Harbor)
     { map = "Steampunk Sewers", diff = "Insane",    minLvl = 120, targetLvl = 125 },
     { map = "Steampunk Sewers", diff = "Nightmare", minLvl = 125, targetLvl = 140 },
 
@@ -813,3 +815,3020 @@ local function makeLoadoutReservation(loadout)
     end
     return reserved
 end
+
+local autoEquipRunning = false
+local inventoryAutomationBusy = false
+local lastAutoEquipAt = -math.huge
+local inventoryRunToken = nil
+local function beginInventoryRun(kind)
+    if inventoryAutomationBusy then return nil end
+    local token = {}
+    inventoryRunToken = token
+    inventoryAutomationBusy = true
+    autoEquipRunning = kind == "equip"
+    autoSellRunning = kind == "sell"
+    task.delay(20, function()
+        if inventoryRunToken == token then
+            inventoryRunToken = nil
+            inventoryAutomationBusy = false
+            autoEquipRunning = false
+            autoSellRunning = false
+            if kind == "equip" then
+                nextAutoEquipAllowedAt = os.clock() + 30
+            else
+                nextAutoSellAllowedAt = os.clock() + 30
+            end
+            if runtimeActive() and UI then UI.addLog("Inventory operation timed out and was released", "warn") end
+        end
+    end)
+    return token
+end
+
+local function finishInventoryRun(token)
+    if inventoryRunToken ~= token then return end
+    inventoryRunToken = nil
+    inventoryAutomationBusy = false
+    autoEquipRunning = false
+    autoSellRunning = false
+end
+
+local function runAutoEquip()
+    if isHost or not runtimeActive() or autoEquipRunning or inventoryAutomationBusy or os.clock() < nextAutoEquipAllowedAt then return end
+    if isInDungeon() then
+        local char = localPlayer.Character
+        local busy = char and char:FindFirstChild("busyCasting")
+        if busy and busy.Value == true then return end
+    end
+    local runToken = beginInventoryRun("equip")
+    if not runToken then return end
+    if UI then UI.setFlow("OPTIMIZING LOADOUT", Color3.fromRGB(168, 85, 247)) end
+
+    local ok, inventory = invokeRemote("reloadInvy")
+    if not runtimeActive() or not ok or typeof(inventory) ~= "table" then
+        nextAutoEquipAllowedAt = os.clock() + 30
+        finishInventoryRun(runToken)
+        return
+    end
+
+    local loadout = getAutoLoadout(inventory)
+    local changes = 0
+    local failed = false
+    local function changeLoadout(remoteName, ...)
+        local called, accepted = invokeRemote(remoteName, ...)
+        local success = called and accepted ~= false
+        if not success then failed = true end
+        return success
+    end
+    local gearInventoryKeys = { weapon = "weapons", chest = "chests", helmet = "helmets" }
+
+    for itemType, plural in pairs(gearInventoryKeys) do
+        if not runtimeActive() then break end
+        local target = loadout.gear[itemType]
+        if target then
+            local equippedKey = nil
+            for key, item in pairs(inventory[plural] or {}) do
+                if typeof(item) == "table" and item.equipped ~= false then
+                    equippedKey = key
+                    break
+                end
+            end
+            if equippedKey ~= target.key then
+                local canEquipTarget = true
+                if equippedKey then
+                    local oldId = getInventoryItemNumericId(equippedKey)
+                    if not oldId or not changeLoadout("unequipItem", itemType, oldId) then
+                        canEquipTarget = false
+                    else
+                        task.wait(CONFIG.EQUIP_REMOTE_DELAY)
+                    end
+                end
+                local targetId = getInventoryItemNumericId(target.key)
+                if canEquipTarget and targetId then
+                    local equipped = changeLoadout("equipItem", itemType, targetId)
+                    if equipped then
+                        changes = changes + 1
+                        task.wait(CONFIG.EQUIP_REMOTE_DELAY)
+                    end
+                end
+            end
+        end
+    end
+
+    if #loadout.abilities > 0 then
+        local desiredSlots = { "q", "e", "q2", "e2" }
+        local currentSlots = {}
+        for key, item in pairs(inventory.abilities or {}) do
+            if typeof(item) == "table" and typeof(item.equipped) == "table" then
+                for _, slot in ipairs(desiredSlots) do
+                    if item.equipped[slot] == true then currentSlots[slot] = key end
+                end
+            end
+        end
+
+        local desiredBySlot = {}
+        for index, entry in ipairs(loadout.abilities) do
+            desiredBySlot[desiredSlots[index]] = entry.key
+        end
+
+        local clearedAbilityKeys = {}
+        for _, slot in ipairs(desiredSlots) do
+            if not runtimeActive() then break end
+            local currentKey = currentSlots[slot]
+            local desiredKey = desiredBySlot[slot]
+            if desiredKey and currentKey and currentKey ~= desiredKey then
+                if clearedAbilityKeys[currentKey] then
+                    currentSlots[slot] = nil
+                else
+                    local oldId = getInventoryItemNumericId(currentKey)
+                    if oldId and changeLoadout("unequipItem", "ability", oldId) then
+                        clearedAbilityKeys[currentKey] = true
+                        for _, occupiedSlot in ipairs(desiredSlots) do
+                            if currentSlots[occupiedSlot] == currentKey then currentSlots[occupiedSlot] = nil end
+                        end
+                        task.wait(CONFIG.EQUIP_REMOTE_DELAY)
+                    end
+                end
+            end
+        end
+
+        for _, slot in ipairs(desiredSlots) do
+            if not runtimeActive() then break end
+            local targetKey = desiredBySlot[slot]
+            if targetKey and currentSlots[slot] ~= targetKey then
+                local targetId = getInventoryItemNumericId(targetKey)
+                if targetId then
+                    local equipped = changeLoadout("equipItem", "ability", targetId, slot)
+                    if equipped then
+                        currentSlots[slot] = targetKey
+                        changes = changes + 1
+                        task.wait(CONFIG.EQUIP_REMOTE_DELAY)
+                    end
+                end
+            end
+        end
+    end
+
+    if changes > 0 and UI then
+        UI.addLog("Loadout optimized: " .. string.upper(loadout.build) .. " (" .. tostring(changes) .. " changes)", "success")
+    end
+    nextAutoEquipAllowedAt = os.clock() + (failed and 30 or CONFIG.AUTO_EQUIP_INTERVAL)
+    finishInventoryRun(runToken)
+end
+
+local function runAutoLevelSell()
+    if isHost or not runtimeActive() or autoSellRunning or inventoryAutomationBusy or os.clock() < nextAutoSellAllowedAt then return end
+    local runToken = beginInventoryRun("sell")
+    if not runToken then return end
+    if UI then UI.setFlow("CLEANING INVENTORY", Color3.fromRGB(244, 63, 94)) end
+
+    local ok, inventory = invokeRemote("reloadInvy")
+    if not runtimeActive() or not ok or typeof(inventory) ~= "table" then
+        nextAutoSellAllowedAt = os.clock() + 30
+        finishInventoryRun(runToken)
+        return
+    end
+
+    local reserved = makeLoadoutReservation(getAutoLoadout(inventory))
+    local payload = { helmet = {}, ability = {}, chest = {}, weapon = {} }
+    local sellCount = 0
+
+    for _, info in ipairs(AUTO_SELL_TYPES) do
+        local bucket = inventory[info.inventoryKey] or {}
+        local highestReq = -1
+        for _, item in pairs(bucket) do
+            if typeof(item) == "table" then
+                highestReq = math.max(highestReq, getItemLevelReq(item))
+            end
+        end
+
+        for key, item in pairs(bucket) do
+            if typeof(item) == "table" then
+                local keep = isInventoryItemEquipped(info.payloadKey, item)
+                    or getItemLevelReq(item) == highestReq
+                    or reserved[info.inventoryKey][key] == true
+                    or (not isHost and info.payloadKey == "ability" and isUniversalHeal(item))
+                    or (info.payloadKey == "ability" and isProtectedAbility(item))
+                    or item.locked == true
+                    or item.favorite == true
+                    or rarityScore(item.rarity) >= rarityScore("legendary")
+                if not keep then
+                    local itemId = getInventoryItemNumericId(key)
+                    if itemId then
+                        table.insert(payload[info.payloadKey], itemId)
+                        sellCount = sellCount + 1
+                    end
+                end
+            end
+        end
+    end
+
+    if sellCount > 0 then
+        local sent = fireRemote("sellItemEvent", payload)
+        if sent and UI then
+            UI.addLog("Inventory cleaned: " .. tostring(sellCount) .. " low-level items sold", "info")
+            task.wait(0.8)
+        end
+    end
+    nextAutoSellAllowedAt = os.clock() + CONFIG.AUTO_SELL_INTERVAL
+    finishInventoryRun(runToken)
+end
+
+local function startInventoryTask(kind, callback)
+    task.spawn(function()
+        if not runtimeActive() then return end
+        local ok, err = xpcall(callback, function(problem) return tostring(problem) end)
+        if ok then return end
+        local token = inventoryRunToken
+        if token then finishInventoryRun(token) end
+        if kind == "equip" then
+            nextAutoEquipAllowedAt = os.clock() + 30
+        else
+            nextAutoSellAllowedAt = os.clock() + 30
+        end
+        reportRemoteProblem("inventory:" .. kind, err)
+        if runtimeActive() and UI then UI.addLog("Inventory " .. kind .. " failed and was released", "warn") end
+    end)
+end
+
+local function createStageLobby(mapName, difficulty)
+    if not isInLobby() then return false, "not_in_lobby" end
+
+    -- Source client passes Hardcore as the fourth createLobby argument.
+    local args = { mapName, difficulty, 0, HARDCORE_ENABLED, true, false }
+    local ok, result = invokeRemote("createLobby", table.unpack(args))
+    if not ok or result ~= true then return false, result end
+
+    pcall(function()
+        local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+        local queueGui = playerGui and playerGui:FindFirstChild("queueGui")
+        local lobbyInfo = queueGui and queueGui:FindFirstChild("lobbyInfo")
+        local chooser = queueGui and queueGui:FindFirstChild("chooseDungeon")
+        if lobbyInfo then
+            local startBackground = lobbyInfo:FindFirstChild("startBackground")
+            local whitelist = lobbyInfo:FindFirstChild("whitelist")
+            if startBackground then startBackground.Visible = true end
+            if whitelist then whitelist.Visible = true end
+            lobbyInfo.Visible = true
+        end
+        if chooser then chooser.Visible = false end
+    end)
+    return true, result
+end
+
+local lastEnterDungeonAttempt = -math.huge
+local function enterDungeon()
+    if not isInLobby() or os.clock() - lastEnterDungeonAttempt < CONFIG.START_COOLDOWN then return false end
+    lastEnterDungeonAttempt = os.clock()
+    if UI then UI.addLog("Entering dungeon", "info") end
+    return fireRemote("startDungeon")
+end
+
+local lastStartAttempt = -math.huge
+local canHostStartMatch = function() return true end
+local function startMatch()
+    -- Keep the host gate ahead of the lobby shortcut below.  Otherwise an
+    -- enterDungeon call from a lobby would bypass the required-clone check.
+    if isHost then
+        local allowed, reason = canHostStartMatch()
+        if not allowed then
+            if UI then UI.addLog("Start delayed: " .. tostring(reason or "clone not ready"), "warn") end
+            return false
+        end
+    end
+    if isInLobby() then return enterDungeon() end
+    local progress = getDungeonProgress()
+    if progress == "in process" or progress == "bosskilled" then return false end
+    if os.clock() - lastStartAttempt < CONFIG.START_COOLDOWN then return false end
+    lastStartAttempt = os.clock()
+    if UI then UI.addLog("Starting stage", "info") end
+    local started = fireRemote("changeStartValue")
+    if started then armNewMatchCycle() end
+    return started
+end
+
+local isLeaving = false
+local function leaveGame(reason)
+    if not runtimeActive() or isLeaving then return end
+    isLeaving = true
+    if not isHost and isInDungeon() then
+        local refreshed = false
+        task.spawn(function()
+            pcall(refreshGamepassPricesForHistory)
+            refreshed = true
+        end)
+        local refreshDeadline = os.clock() + 5
+        repeat task.wait(0.05) until refreshed or os.clock() >= refreshDeadline or not runtimeActive()
+        if not runtimeActive() then isLeaving = false; return false end
+        recordGamepassPriceHistory(reason)
+    end
+    if UI then UI.addLog("Returning to lobby: " .. (reason or "Automatic"), "warn") end
+    local remoteSent = fireRemote("ReturnToLobbyEvent")
+
+    local waitDeadline = os.clock() + 5
+    repeat
+        task.wait(0.5)
+    until isInLobby() or os.clock() >= waitDeadline or not runtimeActive()
+
+    if not runtimeActive() then
+        isLeaving = false
+        return false
+    end
+
+    if isInLobby() then
+        isLeaving = false
+        return true
+    end
+
+    local ok, err = pcall(function() TeleportService:Teleport(lobbyPlaceId, localPlayer) end)
+    if not ok then
+        isLeaving = false
+        return remoteSent
+    else
+        task.delay(10, function() isLeaving = false end)
+        return true
+    end
+end
+
+local THEME
+local ICONS
+local tween
+local statusDot, statusTitle, statusDetail, countdownBadge
+local stageProgressFill, stageName, stageTarget, metricPlace, metricFlow, collapsedStageLabel
+local goldBalanceBadge, passCards
+local autoToggle = true
+local autoSkillEnabled = not isHost and configBoolean(true, "autoSkill", "AutoSkill")
+local addLogEntry
+local formatWithCommas
+
+local function buildUserInterface()
+    local function guiParent()
+        if gethui then
+            local ok, parent = pcall(gethui)
+            if ok and parent then return parent end
+        end
+        return localPlayer:FindFirstChildOfClass("PlayerGui") or localPlayer:WaitForChild("PlayerGui", 5) or game:GetService("CoreGui")
+    end
+
+    local parent = guiParent()
+    local old = parent:FindFirstChild("AutoCarryDashboard")
+    if old then old:Destroy() end
+
+    THEME = isHost and {
+        BG = Color3.fromRGB(196, 220, 222), PANEL = Color3.fromRGB(225, 240, 240), CARD = Color3.fromRGB(210, 231, 231),
+        CARD_HOVER = Color3.fromRGB(193, 219, 220), LINE = Color3.fromRGB(125, 170, 173), ACCENT = Color3.fromRGB(13, 148, 136),
+        ACCENT_2 = Color3.fromRGB(2, 132, 199), TEXT = Color3.fromRGB(18, 49, 55), SUBTEXT = Color3.fromRGB(54, 88, 94),
+        MUTED = Color3.fromRGB(88, 122, 128), GREEN = Color3.fromRGB(5, 134, 94), AMBER = Color3.fromRGB(194, 103, 5),
+        ROSE = Color3.fromRGB(225, 29, 72), CYAN = Color3.fromRGB(2, 132, 199), PURPLE = Color3.fromRGB(109, 40, 217),
+    } or {
+        BG = Color3.fromRGB(198, 211, 235), PANEL = Color3.fromRGB(228, 236, 249), CARD = Color3.fromRGB(212, 224, 244),
+        CARD_HOVER = Color3.fromRGB(195, 211, 239), LINE = Color3.fromRGB(130, 154, 204), ACCENT = Color3.fromRGB(37, 99, 235),
+        ACCENT_2 = Color3.fromRGB(124, 58, 237), TEXT = Color3.fromRGB(23, 37, 68), SUBTEXT = Color3.fromRGB(61, 80, 122),
+        MUTED = Color3.fromRGB(91, 111, 155), GREEN = Color3.fromRGB(5, 134, 94), AMBER = Color3.fromRGB(194, 103, 5),
+        ROSE = Color3.fromRGB(225, 29, 72), CYAN = Color3.fromRGB(2, 132, 199), PURPLE = Color3.fromRGB(124, 58, 237),
+    }
+
+    ICONS = {
+        HOME = "rbxassetid://6031075931", CONTROL = "rbxassetid://6031280882", LOG = "rbxassetid://6031082533",
+        PLAY = "rbxassetid://6031097225", REPLAY = "rbxassetid://6031094678", EXIT = "rbxassetid://6031086342",
+        SHIELD = "rbxassetid://6031075929", TRASH = "rbxassetid://6031094687", USERS = "rbxassetid://6031075938",
+        COIN = "rbxassetid://6031075937", GIFT = "rbxassetid://6031075939", CHECK = "rbxassetid://6031094667",
+        CLOSE = "rbxassetid://6031094678", MINUS = "rbxassetid://6035067836", CROWN = "rbxassetid://7072718362",
+        BOLT = "rbxassetid://6031068421", EDIT = "rbxassetid://6031091004", SAVE = "rbxassetid://6031094677",
+    }
+
+    local function corner(object, radius)
+        local value = Instance.new("UICorner")
+        value.CornerRadius = UDim.new(0, radius or 12)
+        value.Parent = object
+        return value
+    end
+
+    local function stroke(object, color, transparency, thickness)
+        local value = Instance.new("UIStroke")
+        value.Color = color or THEME.LINE
+        value.Transparency = transparency or 0
+        value.Thickness = thickness or 1
+        value.Parent = object
+        return value
+    end
+
+    local function padding(object, x, y)
+        local value = Instance.new("UIPadding")
+        value.PaddingLeft, value.PaddingRight = UDim.new(0, x or 0), UDim.new(0, x or 0)
+        value.PaddingTop, value.PaddingBottom = UDim.new(0, y or 0), UDim.new(0, y or 0)
+        value.Parent = object
+        return value
+    end
+
+    tween = function(object, props, duration, style)
+        if not object then return end
+        local motion = TweenService:Create(object, TweenInfo.new(duration or 0.25, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
+        motion:Play()
+        return motion
+    end
+
+    local function cardSurface(object, accent, radius, hoverable)
+        accent = accent or THEME.ACCENT
+        object.BackgroundColor3 = THEME.PANEL
+        object.ClipsDescendants = true
+        corner(object, radius or 16)
+        local outline = stroke(object, THEME.LINE, 0.28)
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, THEME.CARD),
+            ColorSequenceKeypoint.new(0.48, THEME.PANEL),
+            ColorSequenceKeypoint.new(1, THEME.CARD_HOVER),
+        })
+        gradient.Rotation, gradient.Parent = 22, object
+        local topEdge = Instance.new("Frame")
+        topEdge.Size, topEdge.Position = UDim2.new(1, -32, 0, 1), UDim2.fromOffset(16, 0)
+        topEdge.BackgroundColor3, topEdge.BackgroundTransparency, topEdge.BorderSizePixel, topEdge.Parent = accent, 0.24, 0, object
+        local edgeGradient = Instance.new("UIGradient")
+        edgeGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.25, 0.4),
+            NumberSequenceKeypoint.new(0.75, 0.4),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        edgeGradient.Parent = topEdge
+        local sheen = Instance.new("Frame")
+        sheen.Size, sheen.Position = UDim2.new(0.46, 0, 2, 0), UDim2.new(-0.38, 0, -0.5, 0)
+        sheen.BackgroundColor3, sheen.BackgroundTransparency, sheen.BorderSizePixel, sheen.Rotation, sheen.Parent = THEME.TEXT, 0.965, 0, -18, object
+        local sheenGradient = Instance.new("UIGradient")
+        sheenGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.5, 0.22),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        sheenGradient.Parent = sheen
+        if hoverable then
+            object.Active = true
+            local scale = Instance.new("UIScale")
+            scale.Parent = object
+            object.MouseEnter:Connect(function()
+                tween(scale, { Scale = 1.012 }, 0.22)
+                tween(outline, { Color = accent, Transparency = 0.05 }, 0.22)
+                tween(gradient, { Offset = Vector2.new(0.1, 0) }, 0.3)
+                sheen.Position = UDim2.new(-0.38, 0, -0.5, 0)
+                tween(sheen, { Position = UDim2.new(1.05, 0, -0.5, 0) }, 0.65, Enum.EasingStyle.Quad)
+            end)
+            object.MouseLeave:Connect(function()
+                tween(scale, { Scale = 1 }, 0.28)
+                tween(outline, { Color = THEME.LINE, Transparency = 0.28 }, 0.28)
+                tween(gradient, { Offset = Vector2.new(0, 0) }, 0.3)
+            end)
+        end
+        return outline, gradient
+    end
+
+    local function label(parentObject, text, size, position, textSize, color, weight)
+        local value = Instance.new("TextLabel")
+        value.BackgroundTransparency = 1
+        value.Size, value.Position = size, position or UDim2.new()
+        value.Font = weight or Enum.Font.GothamMedium
+        value.Text, value.TextSize = text or "", textSize or 13
+        value.TextColor3 = color or THEME.TEXT
+        value.TextXAlignment = Enum.TextXAlignment.Left
+        value.TextTruncate = Enum.TextTruncate.AtEnd
+        value.Parent = parentObject
+        return value
+    end
+
+    local function image(parentObject, asset, size, position, color)
+        local value = Instance.new("ImageLabel")
+        value.BackgroundTransparency = 1
+        value.Image, value.ImageColor3 = asset, color or THEME.TEXT
+        value.Size, value.Position = size, position or UDim2.new()
+        value.ScaleType = Enum.ScaleType.Fit
+        value.Parent = parentObject
+        return value
+    end
+
+    local function button(parentObject, text, asset, accent, callback)
+        local value = Instance.new("TextButton")
+        value.AutoButtonColor = false
+        value.BackgroundColor3 = THEME.CARD
+        value.Text = ""
+        value.ClipsDescendants = true
+        value.Parent = parentObject
+        corner(value, 13)
+        local outline = stroke(value, THEME.LINE, 0.22)
+        local gradient = Instance.new("UIGradient")
+        gradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, THEME.CARD_HOVER),
+            ColorSequenceKeypoint.new(0.48, THEME.CARD),
+            ColorSequenceKeypoint.new(1, THEME.PANEL),
+        })
+        gradient.Rotation, gradient.Parent = 18, value
+        local highlight = Instance.new("Frame")
+        highlight.Size, highlight.Position = UDim2.new(1, -22, 0, 1), UDim2.fromOffset(11, 0)
+        highlight.BackgroundColor3, highlight.BackgroundTransparency, highlight.BorderSizePixel, highlight.Parent = accent or THEME.ACCENT, 0.5, 0, value
+        local scale = Instance.new("UIScale")
+        scale.Parent = value
+        local icon = image(value, asset, UDim2.fromOffset(18, 18), UDim2.fromOffset(14, 11), accent or THEME.ACCENT)
+        local textLabel = label(value, text, UDim2.new(1, -48, 1, 0), UDim2.fromOffset(42, 0), 13, THEME.TEXT, Enum.Font.GothamBold)
+        value.MouseEnter:Connect(function()
+            tween(value, { BackgroundColor3 = THEME.CARD_HOVER }, 0.2)
+            tween(outline, { Color = accent or THEME.ACCENT, Transparency = 0 }, 0.2)
+            tween(scale, { Scale = 1.015 }, 0.2)
+            tween(gradient, { Offset = Vector2.new(0.12, 0) }, 0.25)
+            tween(icon, { Position = UDim2.fromOffset(16, 11) }, 0.2)
+        end)
+        value.MouseLeave:Connect(function()
+            tween(value, { BackgroundColor3 = THEME.CARD }, 0.25)
+            tween(outline, { Color = THEME.LINE, Transparency = 0.25 }, 0.25)
+            tween(scale, { Scale = 1 }, 0.25)
+            tween(gradient, { Offset = Vector2.new(0, 0) }, 0.3)
+            tween(icon, { Position = UDim2.fromOffset(14, 11) }, 0.25)
+        end)
+        value.MouseButton1Down:Connect(function()
+            tween(scale, { Scale = 0.975 }, 0.08)
+        end)
+        value.MouseButton1Up:Connect(function()
+            tween(scale, { Scale = 1.015 }, 0.14)
+        end)
+        if callback then value.MouseButton1Click:Connect(callback) end
+        return value, textLabel
+    end
+
+    local function input(parentObject, placeholder, initial)
+        local value = Instance.new("TextBox")
+        value.BackgroundColor3 = THEME.CARD
+        value.ClearTextOnFocus = false
+        value.PlaceholderText, value.Text = placeholder or "", initial or ""
+        value.PlaceholderColor3, value.TextColor3 = THEME.MUTED, THEME.TEXT
+        value.Font, value.TextSize = Enum.Font.GothamSemibold, 13
+        value.TextXAlignment = Enum.TextXAlignment.Left
+        value.Parent = parentObject
+        padding(value, 12, 0)
+        corner(value, 12)
+        local line = stroke(value, THEME.LINE, 0.35)
+        local scale = Instance.new("UIScale")
+        scale.Parent = value
+        local focusLine = Instance.new("Frame")
+        focusLine.Size, focusLine.Position = UDim2.new(0, 0, 0, 2), UDim2.new(0, 12, 1, -2)
+        focusLine.BackgroundColor3, focusLine.BorderSizePixel, focusLine.Parent = THEME.ACCENT, 0, value
+        corner(focusLine, 2)
+        value.Focused:Connect(function()
+            tween(line, { Color = THEME.ACCENT, Transparency = 0 }, 0.2)
+            tween(scale, { Scale = 1.01 }, 0.2)
+            tween(focusLine, { Size = UDim2.new(1, -24, 0, 2) }, 0.25)
+        end)
+        value.FocusLost:Connect(function()
+            tween(line, { Color = THEME.LINE, Transparency = 0.35 }, 0.2)
+            tween(scale, { Scale = 1 }, 0.2)
+            tween(focusLine, { Size = UDim2.new(0, 0, 0, 2) }, 0.2)
+        end)
+        return value
+    end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name, screen.ResetOnSpawn, screen.IgnoreGuiInset = "AutoCarryDashboard", false, true
+    screen.ZIndexBehavior, screen.DisplayOrder = Enum.ZIndexBehavior.Sibling, 9999
+    screen.Parent = parent
+
+    local main = Instance.new("Frame")
+    main.Name = "Window"
+    main.AnchorPoint, main.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5)
+    main.Size, main.BackgroundColor3 = UDim2.fromOffset(780, 500), THEME.BG
+    main.ClipsDescendants, main.Parent = true, screen
+    corner(main, 18)
+    local mainStroke = stroke(main, THEME.ACCENT, 0.45, 1)
+    local topGlow = Instance.new("Frame")
+    topGlow.Size, topGlow.Position = UDim2.new(0.62, 0, 0, 2), UDim2.fromScale(0.19, 0)
+    topGlow.BackgroundColor3, topGlow.BorderSizePixel, topGlow.Parent = THEME.ACCENT, 0, main
+    corner(topGlow, 2)
+    local topGlowGradient = Instance.new("UIGradient")
+    topGlowGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(1, 1),
+    })
+    topGlowGradient.Parent = topGlow
+    local bgGradient = Instance.new("UIGradient")
+    bgGradient.Color = ColorSequence.new(THEME.BG, THEME.PANEL)
+    bgGradient.Rotation, bgGradient.Parent = 135, main
+    local innerBorder = Instance.new("Frame")
+    innerBorder.Size, innerBorder.Position, innerBorder.BackgroundTransparency, innerBorder.BorderSizePixel, innerBorder.Parent = UDim2.new(1, -16, 1, -16), UDim2.fromOffset(8, 8), 1, 0, main
+    corner(innerBorder, 14)
+    stroke(innerBorder, THEME.TEXT, 0.94)
+    local diagonalLight = Instance.new("Frame")
+    diagonalLight.Size, diagonalLight.Position = UDim2.fromOffset(420, 620), UDim2.fromOffset(500, -250)
+    diagonalLight.BackgroundColor3, diagonalLight.BackgroundTransparency, diagonalLight.BorderSizePixel, diagonalLight.Rotation, diagonalLight.Parent = THEME.ACCENT_2, 0.975, 0, -28, main
+    local diagonalGradient = Instance.new("UIGradient")
+    diagonalGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.15),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    diagonalGradient.Parent = diagonalLight
+    local ambientOne = Instance.new("Frame")
+    ambientOne.Size, ambientOne.Position = UDim2.fromOffset(280, 280), UDim2.fromOffset(-120, -150)
+    ambientOne.BackgroundColor3, ambientOne.BackgroundTransparency, ambientOne.BorderSizePixel = THEME.ACCENT, 0.93, 0
+    ambientOne.Parent = main
+    corner(ambientOne, 280)
+    local ambientTwo = Instance.new("Frame")
+    ambientTwo.Size, ambientTwo.Position = UDim2.fromOffset(240, 240), UDim2.new(1, -100, 1, -80)
+    ambientTwo.BackgroundColor3, ambientTwo.BackgroundTransparency, ambientTwo.BorderSizePixel = THEME.ACCENT_2, 0.95, 0
+    ambientTwo.Parent = main
+    corner(ambientTwo, 240)
+
+    local scale = Instance.new("UIScale")
+    scale.Parent = main
+    local camera = workspace.CurrentCamera
+    local function targetScale()
+        local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+        return math.clamp(math.min((viewport.X - 24) / 780, (viewport.Y - 24) / 500), 0.55, 1)
+    end
+    scale.Scale = targetScale() * 0.92
+    tween(scale, { Scale = targetScale() }, 0.55, Enum.EasingStyle.Back)
+    if camera then
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            tween(scale, { Scale = targetScale() }, 0.25)
+        end)
+    end
+    task.spawn(function()
+        while runtimeActive() and screen.Parent do
+            tween(bgGradient, { Rotation = (bgGradient.Rotation + 45) % 360 }, 8, Enum.EasingStyle.Sine)
+            tween(mainStroke, { Transparency = 0.18 }, 1.4, Enum.EasingStyle.Sine)
+            tween(topGlowGradient, { Offset = Vector2.new(1, 0) }, 1.4, Enum.EasingStyle.Sine)
+            tween(diagonalLight, { Position = UDim2.fromOffset(450, -250) }, 3.2, Enum.EasingStyle.Sine)
+            task.wait(1.4)
+            tween(mainStroke, { Transparency = 0.52 }, 1.4, Enum.EasingStyle.Sine)
+            topGlowGradient.Offset = Vector2.new(-1, 0)
+            tween(diagonalLight, { Position = UDim2.fromOffset(500, -250) }, 5.6, Enum.EasingStyle.Sine)
+            task.wait(8)
+        end
+    end)
+
+    local header = Instance.new("Frame")
+    header.Size, header.BackgroundTransparency, header.Parent = UDim2.new(1, 0, 0, 68), 1, main
+    local avatar = image(header, "rbxthumb://type=AvatarHeadShot&id=" .. localPlayer.UserId .. "&w=150&h=150", UDim2.fromOffset(38, 38), UDim2.fromOffset(20, 15), Color3.new(1, 1, 1))
+    avatar.BackgroundColor3, avatar.BackgroundTransparency = THEME.CARD, 0
+    corner(avatar, 12)
+    stroke(avatar, THEME.ACCENT, 0.2)
+    label(header, "AUTO CARRY", UDim2.fromOffset(180, 24), UDim2.fromOffset(72, 11), 19, THEME.TEXT, Enum.Font.GothamBold)
+    label(header, realPlayerName, UDim2.fromOffset(180, 18), UDim2.fromOffset(72, 39), 12, THEME.SUBTEXT, Enum.Font.GothamBold)
+
+    local role = label(header, isHost and "HOST CONTROL" or "CLONE CLIENT", UDim2.fromOffset(124, 30), UDim2.fromOffset(244, 19), 11, THEME.ACCENT, Enum.Font.GothamBold)
+    role.TextXAlignment, role.BackgroundColor3, role.BackgroundTransparency = Enum.TextXAlignment.Center, THEME.CARD, 0
+    corner(role, 13)
+    stroke(role, THEME.ACCENT, 0.45)
+    local roleGradient = Instance.new("UIGradient")
+    roleGradient.Color = ColorSequence.new(THEME.PANEL, THEME.CARD_HOVER)
+    roleGradient.Rotation, roleGradient.Parent = 12, role
+    local roleGlow = Instance.new("Frame")
+    roleGlow.Size, roleGlow.Position = UDim2.fromOffset(4, 14), UDim2.fromOffset(8, 6)
+    roleGlow.BackgroundColor3, roleGlow.BorderSizePixel, roleGlow.Parent = THEME.ACCENT, 0, role
+    corner(roleGlow, 4)
+
+    local function headerButton(asset, rightOffset, callback)
+        local value = Instance.new("ImageButton")
+        value.AutoButtonColor, value.BackgroundColor3 = false, THEME.CARD
+        value.Image, value.ImageColor3 = asset, THEME.SUBTEXT
+        value.Size, value.Position = UDim2.fromOffset(32, 32), UDim2.new(1, rightOffset, 0, 18)
+        value.Parent = header
+        corner(value, 10)
+        value.MouseEnter:Connect(function() tween(value, { BackgroundColor3 = THEME.CARD_HOVER, ImageColor3 = THEME.TEXT }, 0.2) end)
+        value.MouseLeave:Connect(function() tween(value, { BackgroundColor3 = THEME.CARD, ImageColor3 = THEME.SUBTEXT }, 0.2) end)
+        value.MouseButton1Click:Connect(callback)
+        return value
+    end
+
+    local avatarUrl = "rbxthumb://type=AvatarHeadShot&id=" .. localPlayer.UserId .. "&w=150&h=150"
+    avatar.Image = avatarUrl
+
+    local collapsed = Instance.new("TextButton")
+    collapsed.AutoButtonColor, collapsed.Text, collapsed.Visible = false, "", false
+    collapsed.Size, collapsed.Position = UDim2.fromOffset(304, 76), UDim2.new(0, 10, 1, -86)
+    collapsed.BackgroundColor3, collapsed.Parent = THEME.PANEL, screen
+    corner(collapsed, 20)
+    local collapsedStroke = stroke(collapsed, THEME.ACCENT, 0.2)
+    local collapsedGradient = Instance.new("UIGradient")
+    collapsedGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.PANEL),
+        ColorSequenceKeypoint.new(0.72, THEME.CARD),
+        ColorSequenceKeypoint.new(1, THEME.BG),
+    })
+    collapsedGradient.Rotation, collapsedGradient.Parent = 18, collapsed
+    local collapsedScale = Instance.new("UIScale")
+    collapsedScale.Parent = collapsed
+    local hostPulse
+    if isHost then
+        collapsed.Size = UDim2.fromOffset(328, 80)
+        collapsed.BackgroundColor3 = THEME.CARD
+        collapsedStroke.Color, collapsedStroke.Transparency, collapsedStroke.Thickness = THEME.ACCENT, 0.04, 1.5
+        local hostRibbon = Instance.new("Frame")
+        hostRibbon.Size, hostRibbon.Position = UDim2.fromOffset(5, 52), UDim2.fromOffset(0, 14)
+        hostRibbon.BackgroundColor3, hostRibbon.BorderSizePixel, hostRibbon.Parent = THEME.ACCENT, 0, collapsed
+        corner(hostRibbon, 4)
+        local ribbonGradient = Instance.new("UIGradient")
+        ribbonGradient.Color = ColorSequence.new(THEME.ACCENT, THEME.AMBER)
+        ribbonGradient.Rotation, ribbonGradient.Parent = 90, hostRibbon
+        hostPulse = Instance.new("Frame")
+        hostPulse.Size, hostPulse.Position = UDim2.fromOffset(62, 62), UDim2.fromOffset(8, 9)
+        hostPulse.BackgroundColor3, hostPulse.BackgroundTransparency, hostPulse.BorderSizePixel, hostPulse.Parent = THEME.ACCENT, 0.84, 0, collapsed
+        corner(hostPulse, 34)
+        local hostSweep = Instance.new("Frame")
+        hostSweep.Size, hostSweep.Position = UDim2.fromOffset(105, 118), UDim2.fromOffset(-100, -20)
+        hostSweep.BackgroundColor3, hostSweep.BackgroundTransparency, hostSweep.BorderSizePixel, hostSweep.Rotation, hostSweep.Parent = THEME.TEXT, 0.93, 0, -22, collapsed
+        local sweepGradient = Instance.new("UIGradient")
+        sweepGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.5, 0.24),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        sweepGradient.Parent = hostSweep
+        task.spawn(function()
+            while runtimeActive() and hostSweep.Parent do
+                hostSweep.Position = UDim2.fromOffset(-100, -20)
+                tween(hostSweep, { Position = UDim2.fromOffset(335, -20) }, 2.2, Enum.EasingStyle.Sine)
+                tween(hostPulse, { BackgroundTransparency = 0.67 }, 1.1, Enum.EasingStyle.Sine)
+                task.wait(1.1)
+                tween(hostPulse, { BackgroundTransparency = 0.87 }, 1.1, Enum.EasingStyle.Sine)
+                task.wait(1.4)
+            end
+        end)
+    end
+    local miniAvatar = image(collapsed, avatarUrl, isHost and UDim2.fromOffset(54, 54) or UDim2.fromOffset(50, 50), isHost and UDim2.fromOffset(12, 13) or UDim2.fromOffset(14, 13), Color3.new(1, 1, 1))
+    miniAvatar.BackgroundColor3, miniAvatar.BackgroundTransparency = THEME.CARD, 0
+    corner(miniAvatar, isHost and 27 or 16)
+    stroke(miniAvatar, isHost and THEME.AMBER or THEME.ACCENT, 0.05, 2)
+    local onlineDot = Instance.new("Frame")
+    onlineDot.Size, onlineDot.Position, onlineDot.BackgroundColor3 = UDim2.fromOffset(11, 11), UDim2.fromOffset(53, 52), THEME.GREEN
+    onlineDot.BorderSizePixel, onlineDot.Parent = 0, collapsed
+    corner(onlineDot, 8)
+    stroke(onlineDot, THEME.PANEL, 0, 2)
+    local collapsedTitle = label(collapsed, isHost and "HOST CONTROL" or "CLONE CLIENT", UDim2.fromOffset(isHost and 144 or 132, 20), UDim2.fromOffset(isHost and 86 or 78, 14), isHost and 13 or 11, isHost and THEME.ACCENT or THEME.TEXT, Enum.Font.GothamBold)
+    local collapsedState = label(collapsed, "Running", UDim2.fromOffset(isHost and 144 or 132, 18), UDim2.fromOffset(isHost and 86 or 78, 39), isHost and 10 or 9, isHost and THEME.SUBTEXT or THEME.SUBTEXT, Enum.Font.GothamBold)
+    if isHost then
+        collapsedStageLabel = label(collapsed, "STAGE 01  •  LV.6", UDim2.fromOffset(156, 16), UDim2.fromOffset(86, 57), 9, THEME.AMBER, Enum.Font.GothamBold)
+        local hostBadge = label(collapsed, "HOST", UDim2.fromOffset(56, 22), UDim2.new(1, -70, 0, 29), 10, THEME.AMBER, Enum.Font.GothamBold)
+        hostBadge.TextXAlignment, hostBadge.BackgroundColor3, hostBadge.BackgroundTransparency = Enum.TextXAlignment.Center, THEME.PANEL, 0
+        corner(hostBadge, 9)
+        stroke(hostBadge, THEME.AMBER, 0.16)
+    end
+    local miniPassStrip = Instance.new("Frame")
+    miniPassStrip.Size, miniPassStrip.Position = UDim2.fromOffset(82, 28), UDim2.fromOffset(214, 24)
+    miniPassStrip.BackgroundTransparency, miniPassStrip.Parent = 1, collapsed
+    local miniPassLayout = Instance.new("UIListLayout")
+    miniPassLayout.FillDirection, miniPassLayout.Padding, miniPassLayout.VerticalAlignment = Enum.FillDirection.Horizontal, UDim.new(0, 3), Enum.VerticalAlignment.Center
+    miniPassLayout.Parent = miniPassStrip
+    collapsed.MouseEnter:Connect(function()
+        tween(collapsedScale, { Scale = 1.035 }, 0.22)
+        tween(collapsedStroke, { Transparency = 0, Thickness = 1.5 }, 0.22)
+    end)
+    collapsed.MouseLeave:Connect(function()
+        tween(collapsedScale, { Scale = 1 }, 0.28)
+        tween(collapsedStroke, { Transparency = 0.2, Thickness = 1 }, 0.28)
+    end)
+
+    local function setVisible(value)
+        if value then
+            main.Visible = true
+            main.Size = UDim2.fromOffset(740, 470)
+            main.BackgroundTransparency = 0.15
+            tween(main, { Size = UDim2.fromOffset(780, 500), BackgroundTransparency = 0 }, 0.35, Enum.EasingStyle.Back)
+            collapsed.Visible = false
+        else
+            local focused = UserInputService:GetFocusedTextBox()
+            if focused then focused:ReleaseFocus() end
+            tween(main, { Size = UDim2.fromOffset(740, 470), BackgroundTransparency = 0.25 }, 0.2)
+            task.delay(0.2, function()
+                if main.Parent then main.Visible = false; collapsed.Visible = true end
+            end)
+        end
+    end
+    collapsed.MouseButton1Click:Connect(function() setVisible(true) end)
+    headerButton(ICONS.MINUS, -78, function() setVisible(false) end)
+    headerButton(ICONS.CLOSE, -40, function()
+        setVisible(false)
+    end)
+
+    local dragging, dragOrigin, frameOrigin
+    header.InputBegan:Connect(function(event)
+        if event.UserInputType == Enum.UserInputType.MouseButton1 or event.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragOrigin, frameOrigin = true, event.Position, main.Position
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(event)
+        if event.UserInputType == Enum.UserInputType.MouseButton1 or event.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+    UserInputService.InputChanged:Connect(function(event)
+        if dragging and (event.UserInputType == Enum.UserInputType.MouseMovement or event.UserInputType == Enum.UserInputType.Touch) then
+            local delta = event.Position - dragOrigin
+            main.Position = frameOrigin + UDim2.fromOffset(delta.X, delta.Y)
+        end
+    end)
+
+    local nav = Instance.new("Frame")
+    nav.Size, nav.Position = UDim2.fromOffset(72, 414), UDim2.fromOffset(0, 72)
+    nav.BackgroundTransparency, nav.Parent = 1, main
+    local navRail = Instance.new("Frame")
+    navRail.Size, navRail.Position, navRail.Parent = UDim2.fromOffset(58, 198), UDim2.fromOffset(7, 0), nav
+    cardSurface(navRail, THEME.ACCENT, 18, false)
+    local navRailGradient = navRail:FindFirstChildOfClass("UIGradient")
+    if navRailGradient then navRailGradient.Rotation = 90 end
+    local content = Instance.new("Frame")
+    content.Size, content.Position = UDim2.new(1, -90, 1, -86), UDim2.fromOffset(78, 74)
+    content.BackgroundTransparency, content.Parent = 1, main
+
+    local pages, navButtons, activePage = {}, {}, nil
+    local function showPage(name)
+        if activePage == name then return end
+        for pageName, page in pairs(pages) do
+            if pageName == name then
+                page.Visible, page.Position, page.GroupTransparency = true, UDim2.fromOffset(20, 0), 0.3
+                tween(page, { Position = UDim2.fromOffset(0, 0), GroupTransparency = 0 }, 0.35)
+            else
+                page.Visible = false
+            end
+        end
+        for pageName, item in pairs(navButtons) do
+            tween(item.button, { BackgroundColor3 = pageName == name and THEME.CARD_HOVER or THEME.BG }, 0.22)
+            tween(item.icon, { ImageColor3 = pageName == name and THEME.ACCENT or THEME.MUTED }, 0.22)
+            item.marker.Visible = pageName == name
+        end
+        activePage = name
+    end
+
+    local navData = {{"overview", ICONS.HOME}, {"controls", ICONS.CONTROL}, {"activity", ICONS.LOG}}
+    for index, item in ipairs(navData) do
+        local navIndex, navName = index, item[1]
+        local value = Instance.new("TextButton")
+        value.AutoButtonColor, value.Text = false, ""
+        value.Size, value.Position = UDim2.fromOffset(46, 46), UDim2.fromOffset(13, (navIndex - 1) * 58)
+        value.BackgroundColor3, value.Parent = THEME.BG, nav
+        corner(value, 13)
+        local icon = image(value, item[2], UDim2.fromOffset(20, 20), UDim2.fromOffset(13, 13), THEME.MUTED)
+        local marker = Instance.new("Frame")
+        marker.Size, marker.Position = UDim2.fromOffset(3, 20), UDim2.fromOffset(-7, 13)
+        marker.BackgroundColor3, marker.Visible, marker.Parent = THEME.ACCENT, false, value
+        corner(marker, 2)
+        navButtons[navName] = { button = value, icon = icon, marker = marker }
+        value.MouseEnter:Connect(function()
+            tween(value, { Size = UDim2.fromOffset(48, 48), Position = UDim2.fromOffset(12, ((navIndex - 1) * 58) - 1) }, 0.2)
+            tween(icon, { ImageColor3 = THEME.TEXT, Rotation = 5 }, 0.2)
+        end)
+        value.MouseLeave:Connect(function()
+            tween(value, { Size = UDim2.fromOffset(46, 46), Position = UDim2.fromOffset(13, (navIndex - 1) * 58) }, 0.24)
+            tween(icon, { ImageColor3 = activePage == navName and THEME.ACCENT or THEME.MUTED, Rotation = 0 }, 0.24)
+        end)
+        value.MouseButton1Click:Connect(function() showPage(navName) end)
+    end
+
+    local function newPage(name)
+        local page = Instance.new("CanvasGroup")
+        page.Name, page.Size, page.BackgroundTransparency, page.Visible = name, UDim2.fromScale(1, 1), 1, false
+        page.Parent, pages[name] = content, page
+        return page
+    end
+
+    local overview = newPage("overview")
+    local statusCard = Instance.new("Frame")
+    statusCard.Size, statusCard.Parent = UDim2.new(1, 0, 0, 94), overview
+    cardSurface(statusCard, THEME.CYAN, 18, true)
+    local statusAccent = Instance.new("Frame")
+    statusAccent.Size, statusAccent.Position, statusAccent.BackgroundColor3, statusAccent.BorderSizePixel, statusAccent.Parent = UDim2.fromOffset(3, 54), UDim2.fromOffset(0, 20), THEME.CYAN, 0, statusCard
+    corner(statusAccent, 3)
+    local statusAccentGradient = Instance.new("UIGradient")
+    statusAccentGradient.Color = ColorSequence.new(THEME.ACCENT, THEME.CYAN)
+    statusAccentGradient.Rotation, statusAccentGradient.Parent = 90, statusAccent
+    statusDot = Instance.new("Frame")
+    statusDot.Size, statusDot.Position, statusDot.BackgroundColor3, statusDot.Parent = UDim2.fromOffset(9, 9), UDim2.fromOffset(18, 20), THEME.CYAN, statusCard
+    corner(statusDot, 9)
+    task.spawn(function()
+        while runtimeActive() and statusDot.Parent do
+            tween(statusDot, { BackgroundTransparency = 0.65 }, 0.8, Enum.EasingStyle.Sine); task.wait(0.8)
+            tween(statusDot, { BackgroundTransparency = 0 }, 0.8, Enum.EasingStyle.Sine); task.wait(0.8)
+        end
+    end)
+    statusTitle = label(statusCard, "INITIALIZING", UDim2.new(1, -180, 0, 24), UDim2.fromOffset(40, 12), 15, THEME.CYAN, Enum.Font.GothamBold)
+    statusDetail = label(statusCard, "Preparing automation", UDim2.new(1, -58, 0, 22), UDim2.fromOffset(18, 44), 12, THEME.SUBTEXT, Enum.Font.GothamSemibold)
+    countdownBadge = label(statusCard, "", UDim2.fromOffset(164, 30), UDim2.new(1, -182, 0, 11), 11, THEME.ACCENT, Enum.Font.GothamBold)
+    countdownBadge.TextXAlignment, countdownBadge.BackgroundColor3 = Enum.TextXAlignment.Center, THEME.CARD
+    corner(countdownBadge, 10)
+
+    local stageCard = Instance.new("Frame")
+    stageCard.Size, stageCard.Position = UDim2.new(1, 0, 0, 116), UDim2.fromOffset(0, 106)
+    stageCard.Parent = overview
+    cardSurface(stageCard, THEME.ACCENT, 18, true)
+    local stageHalo = Instance.new("Frame")
+    stageHalo.Size, stageHalo.Position, stageHalo.BackgroundColor3, stageHalo.BackgroundTransparency, stageHalo.BorderSizePixel, stageHalo.Parent = UDim2.fromOffset(130, 130), UDim2.new(1, -80, 0, -70), THEME.ACCENT_2, 0.94, 0, stageCard
+    corner(stageHalo, 65)
+    local stageNumber = label(stageCard, "01", UDim2.fromOffset(34, 34), UDim2.fromOffset(16, 12), 11, THEME.ACCENT, Enum.Font.GothamBold)
+    stageNumber.TextXAlignment, stageNumber.BackgroundColor3 = Enum.TextXAlignment.Center, THEME.BG
+    corner(stageNumber, 11); stroke(stageNumber, THEME.ACCENT, 0.35)
+    stageName = label(stageCard, "", UDim2.new(1, -280, 0, 24), UDim2.fromOffset(60, 10), 17, THEME.TEXT, Enum.Font.GothamBold)
+    stageTarget = label(stageCard, "", UDim2.new(1, -280, 0, 20), UDim2.fromOffset(60, 36), 11, THEME.ACCENT, Enum.Font.GothamBold)
+    local currentLevelLabel = label(stageCard, "CURRENT LV.0", UDim2.fromOffset(128, 20), UDim2.new(1, -146, 0, 46), 10, THEME.SUBTEXT, Enum.Font.GothamBold)
+    currentLevelLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+    local stagePrevControl, stageNextControl
+    local function stageControl(asset, rotation, xOffset, action)
+        local value = Instance.new("ImageButton")
+        value.AutoButtonColor, value.BackgroundColor3 = false, THEME.BG
+        value.Image, value.ImageColor3, value.ImageTransparency = asset, THEME.ACCENT, 0.05
+        value.Rotation, value.Size, value.Position = rotation or 0, UDim2.fromOffset(30, 30), UDim2.new(1, xOffset, 0, 12)
+        value.Parent = stageCard
+        corner(value, 9)
+        local outline = stroke(value, THEME.LINE, 0.42)
+        value.MouseEnter:Connect(function()
+            tween(value, { BackgroundColor3 = THEME.CARD_HOVER, ImageColor3 = THEME.TEXT }, 0.18)
+            tween(outline, { Color = THEME.ACCENT, Transparency = 0.05 }, 0.18)
+        end)
+        value.MouseLeave:Connect(function()
+            tween(value, { BackgroundColor3 = THEME.BG, ImageColor3 = THEME.ACCENT }, 0.22)
+            tween(outline, { Color = THEME.LINE, Transparency = 0.42 }, 0.22)
+        end)
+        value.MouseButton1Click:Connect(action)
+        return value
+    end
+    if isHost then
+        stagePrevControl = stageControl(ICONS.PLAY, 180, -118, function()
+            currentStage = math.max(1, currentStage - 1)
+            saveStage()
+            UI.setStage(currentStage)
+            UI.addLog("Target moved to previous stage", "info")
+        end)
+        stageControl(ICONS.REPLAY, 0, -80, function()
+            currentStage = 1
+            saveStage()
+            UI.setStage(currentStage)
+            UI.addLog("Target reset to stage 1", "warn")
+        end)
+        stageNextControl = stageControl(ICONS.PLAY, 0, -42, function()
+            currentStage = math.min(#STAGES, currentStage + 1)
+            saveStage()
+            UI.setStage(currentStage)
+            UI.addLog("Target moved to next stage", "info")
+        end)
+    end
+    local bar = Instance.new("Frame")
+    bar.Size, bar.Position, bar.BackgroundColor3, bar.ClipsDescendants, bar.Parent = UDim2.new(1, -36, 0, 7), UDim2.fromOffset(18, 68), THEME.BG, true, stageCard
+    corner(bar, 8)
+    stageProgressFill = Instance.new("Frame")
+    stageProgressFill.Size, stageProgressFill.BackgroundColor3, stageProgressFill.Parent = UDim2.new(0, 0, 1, 0), THEME.ACCENT, bar
+    corner(stageProgressFill, 8)
+    local fillGradient = Instance.new("UIGradient")
+    fillGradient.Color, fillGradient.Parent = ColorSequence.new(THEME.ACCENT, THEME.ACCENT_2), stageProgressFill
+    task.spawn(function()
+        while runtimeActive() and fillGradient.Parent do
+            tween(fillGradient, { Offset = Vector2.new(0.8, 0) }, 1.6, Enum.EasingStyle.Sine)
+            task.wait(1.6)
+            fillGradient.Offset = Vector2.new(-0.8, 0)
+            task.wait(0.15)
+        end
+    end)
+
+    local metrics = Instance.new("Frame")
+    metrics.Size, metrics.Position, metrics.BackgroundTransparency, metrics.Parent = UDim2.new(1, 0, 0, 66), UDim2.fromOffset(0, 234), 1, overview
+    local metricLayout = Instance.new("UIGridLayout")
+    metricLayout.CellSize, metricLayout.CellPadding, metricLayout.Parent = UDim2.new(0.5, -6, 1, 0), UDim2.fromOffset(12, 0), metrics
+    local function metric(titleText, accent, iconAsset)
+        local card = Instance.new("Frame")
+        card.Parent = metrics
+        cardSurface(card, accent, 16, true)
+        local metricIcon = image(card, iconAsset, UDim2.fromOffset(18, 18), UDim2.new(1, -34, 0, 12), accent)
+        metricIcon.ImageTransparency = 0.22
+        label(card, titleText, UDim2.new(1, -42, 0, 17), UDim2.fromOffset(14, 9), 10, accent, Enum.Font.GothamBold)
+        return label(card, "--", UDim2.new(1, -24, 0, 24), UDim2.fromOffset(14, 29), 14, THEME.TEXT, Enum.Font.GothamBold)
+    end
+    metricPlace = metric("LOCATION", THEME.CYAN, ICONS.HOME)
+    metricFlow = metric("AUTOMATION", THEME.PURPLE, ICONS.BOLT)
+
+    local quick = Instance.new("Frame")
+    quick.Size, quick.Position, quick.BackgroundTransparency, quick.Parent = UDim2.new(1, 0, 0, 102), UDim2.fromOffset(0, 312), 1, overview
+    local quickLayout = Instance.new("UIGridLayout")
+    quickLayout.CellSize, quickLayout.CellPadding, quickLayout.SortOrder, quickLayout.Parent = UDim2.new(0.5, -6, 0, 44), UDim2.fromOffset(12, 10), Enum.SortOrder.LayoutOrder, quick
+    if isHost then
+        local function replayCurrentStage()
+            local stage = STAGES[currentStage]
+            fireRemote("replayDungeon", {{
+                dungeonProgress = "bossKilled", dungeonStarted = true, dungeonFinished = true,
+                hardcore = HARDCORE_ENABLED, dungeonName = stage.map, isHardcore = HARDCORE_ENABLED, fightingBoss = true,
+            }})
+        end
+        local function returnToLobby()
+            task.spawn(leaveGame, "Manual return")
+        end
+        local startButton = button(quick, "Start dungeon", ICONS.PLAY, THEME.GREEN, startMatch)
+        startButton.LayoutOrder = 1
+        local replayButton = button(quick, "Replay stage", ICONS.REPLAY, THEME.PURPLE, replayCurrentStage)
+        replayButton.LayoutOrder = 2
+        local clearButton = button(quick, "Clear clone data", ICONS.TRASH, THEME.ROSE, function()
+            clearCloneData()
+        end)
+        clearButton.LayoutOrder = 3
+        local returnButton = button(quick, "Return to lobby", ICONS.EXIT, THEME.ROSE, returnToLobby)
+        returnButton.LayoutOrder = 4
+    else
+        local function optimizeLoadout()
+            startInventoryTask("equip", runAutoEquip)
+        end
+        local function cleanInventory()
+            startInventoryTask("sell", runAutoLevelSell)
+        end
+        local function returnToLobby()
+            task.spawn(leaveGame, "Manual return")
+        end
+        local optimizeButton = button(quick, "Optimize loadout", ICONS.SHIELD, THEME.GREEN, optimizeLoadout)
+        optimizeButton.LayoutOrder = 1
+        local sellButton = button(quick, "Clean inventory", ICONS.TRASH, THEME.CYAN, cleanInventory)
+        sellButton.LayoutOrder = 2
+        local returnButton = button(quick, "Return to lobby", ICONS.EXIT, THEME.ROSE, returnToLobby)
+        returnButton.LayoutOrder = 3
+        local goldCard = Instance.new("Frame")
+        goldCard.LayoutOrder, goldCard.Parent = 4, quick
+        cardSurface(goldCard, THEME.AMBER, 13, true)
+        goldBalanceBadge = label(goldCard, "GOLD 0", UDim2.fromScale(1, 1), nil, 14, THEME.AMBER, Enum.Font.GothamBold)
+        goldBalanceBadge.TextXAlignment = Enum.TextXAlignment.Center
+    end
+
+    passCards = {}
+    if not isHost then
+        local passInfo = {
+            { "vip", "VIP", ICONS.CROWN, THEME.PURPLE },
+            { "goldGamepass", "2X GOLD", ICONS.COIN, THEME.AMBER },
+            { "extraItemGamepass", "+1 ITEM", ICONS.GIFT, THEME.CYAN },
+            { "freeStatResets", "RESET", ICONS.REPLAY, THEME.GREEN },
+        }
+        for index, info in ipairs(passInfo) do
+            local chip = Instance.new("Frame")
+            chip.Size = UDim2.new(0.25, -7, 0, 24)
+            chip.Position = UDim2.new((index - 1) * 0.25, 18 - ((index - 1) * 3), 0, 82)
+            chip.Parent = stageCard
+            local chipStroke = cardSurface(chip, info[4], 9, true)
+            local chipIcon = image(chip, info[3], UDim2.fromOffset(13, 13), UDim2.fromOffset(8, 5), THEME.MUTED)
+            chipIcon.ImageTransparency = 0.48
+            local badge = label(chip, info[2], UDim2.new(1, -28, 1, 0), UDim2.fromOffset(26, 0), 9, THEME.MUTED, Enum.Font.GothamBold)
+            local miniBox = Instance.new("Frame")
+            miniBox.Size, miniBox.BackgroundColor3, miniBox.Parent = UDim2.fromOffset(18, 18), THEME.BG, miniPassStrip
+            corner(miniBox, 6)
+            local miniStroke = stroke(miniBox, THEME.LINE, 0.62)
+            local miniIcon = image(miniBox, info[3], UDim2.fromOffset(11, 11), UDim2.fromOffset(3, 3), THEME.MUTED)
+            miniIcon.ImageTransparency = 0.5
+            passCards[info[1]] = {
+                badge = badge, name = info[2], color = info[4], chip = chip,
+                stroke = chipStroke, icon = chipIcon, mini = miniBox,
+                miniStroke = miniStroke, miniIcon = miniIcon, state = nil,
+            }
+        end
+    else
+        miniPassStrip.Visible = false
+    end
+
+    local controls = newPage("controls")
+    local toggleCard = Instance.new("Frame")
+    toggleCard.Size, toggleCard.Parent = UDim2.new(1, 0, 0, 76), controls
+    cardSurface(toggleCard, THEME.ACCENT, 18, true)
+    local automationTitle = label(toggleCard, "AUTOMATION", UDim2.new(0.5, -110, 0, 22), UDim2.fromOffset(18, 12), 14, THEME.ACCENT, Enum.Font.GothamBold)
+    local automationDetail = label(toggleCard, "Pause or resume all tasks", UDim2.new(0.5, -110, 0, 18), UDim2.fromOffset(18, 40), 11, THEME.SUBTEXT, Enum.Font.GothamSemibold)
+    local switch = Instance.new("TextButton")
+    switch.AutoButtonColor, switch.Text, switch.Size = false, "", UDim2.fromOffset(58, 30)
+    switch.Position, switch.BackgroundColor3, switch.Parent = UDim2.new(0.5, -76, 0, 23), THEME.ACCENT, toggleCard
+    corner(switch, 15)
+    local knob = Instance.new("Frame")
+    knob.Size, knob.Position, knob.BackgroundColor3, knob.Parent = UDim2.fromOffset(24, 24), UDim2.fromOffset(31, 3), THEME.TEXT, switch
+    corner(knob, 12)
+    switch.MouseButton1Click:Connect(function()
+        autoToggle = not autoToggle
+        tween(switch, { BackgroundColor3 = autoToggle and THEME.ACCENT or THEME.MUTED }, 0.25)
+        tween(knob, { Position = autoToggle and UDim2.fromOffset(31, 3) or UDim2.fromOffset(3, 3) }, 0.3, Enum.EasingStyle.Back)
+        collapsedState.Text = autoToggle and "Running" or "Paused"
+        if UI then UI.addLog(autoToggle and "Automation resumed" or "Automation paused", autoToggle and "success" or "warn") end
+    end)
+
+    local toggleDivider = Instance.new("Frame")
+    toggleDivider.Size, toggleDivider.Position = UDim2.fromOffset(1, 48), UDim2.new(0.5, 0, 0, 14)
+    toggleDivider.BackgroundColor3, toggleDivider.BackgroundTransparency, toggleDivider.BorderSizePixel, toggleDivider.Parent = THEME.LINE, 0.3, 0, toggleCard
+    local autoSkillTitle = label(toggleCard, "AUTO SKILL", UDim2.new(0.5, -110, 0, 22), UDim2.new(0.5, 18, 0, 12), 14, THEME.PURPLE, Enum.Font.GothamBold)
+    local autoSkillDetail = label(toggleCard, "Safe direct cast with manual grace", UDim2.new(0.5, -110, 0, 18), UDim2.new(0.5, 18, 0, 40), 11, THEME.SUBTEXT, Enum.Font.GothamSemibold)
+    local skillSwitch = Instance.new("TextButton")
+    skillSwitch.AutoButtonColor, skillSwitch.Text, skillSwitch.Size = false, "", UDim2.fromOffset(58, 30)
+    skillSwitch.Position, skillSwitch.BackgroundColor3, skillSwitch.Parent = UDim2.new(1, -76, 0, 23), THEME.ACCENT, toggleCard
+    corner(skillSwitch, 15)
+    local skillKnob = Instance.new("Frame")
+    skillKnob.Size, skillKnob.Position, skillKnob.BackgroundColor3, skillKnob.Parent = UDim2.fromOffset(24, 24), UDim2.fromOffset(31, 3), THEME.TEXT, skillSwitch
+    corner(skillKnob, 12)
+    skillSwitch.MouseButton1Click:Connect(function()
+        autoSkillEnabled = not autoSkillEnabled
+        tween(skillSwitch, { BackgroundColor3 = autoSkillEnabled and THEME.ACCENT or THEME.MUTED }, 0.25)
+        tween(skillKnob, { Position = autoSkillEnabled and UDim2.fromOffset(31, 3) or UDim2.fromOffset(3, 3) }, 0.3, Enum.EasingStyle.Back)
+        if UI then UI.addLog(autoSkillEnabled and "Auto Skill enabled" or "Auto Skill disabled", autoSkillEnabled and "success" or "warn") end
+    end)
+    if isHost then
+        automationTitle.Size, automationDetail.Size = UDim2.new(1, -110, 0, 20), UDim2.new(1, -110, 0, 16)
+        switch.Position = UDim2.new(1, -76, 0, 23)
+        toggleDivider.Visible, autoSkillTitle.Visible, autoSkillDetail.Visible, skillSwitch.Visible = false, false, false, false
+    end
+
+    local settings = Instance.new("Frame")
+    settings.Size, settings.Position = UDim2.new(1, 0, 0, 304), UDim2.fromOffset(0, 90)
+    settings.Parent = controls
+    cardSurface(settings, THEME.PURPLE, 18, true)
+    label(settings, "ACCOUNT AND LOADOUT", UDim2.new(1, -36, 0, 22), UDim2.fromOffset(18, 14), 12, THEME.PURPLE, Enum.Font.GothamBold)
+
+    local hostInput = input(settings, "Host username", HOST_NAME)
+    hostInput.Size, hostInput.Position = UDim2.new(1, -166, 0, 40), UDim2.fromOffset(18, 50)
+    local saveHost = button(settings, "Save host", ICONS.SAVE, THEME.ACCENT, function()
+        local name = hostInput.Text:match("^%s*(.-)%s*$")
+        if #name < 3 or #name > 20 or not name:match("^[%w_]+$") then
+            UI.addLog("Invalid Roblox username", "warn")
+            return
+        end
+        local roleWillChange = (string.lower(realPlayerName) == string.lower(name)) ~= isHost
+        HOST_NAME = name
+        pcall(function() if writefile then writefile(HOST_NAME_FILE, name) end end)
+        UI.addLog("Host updated: " .. name .. (roleWillChange and " | restart required" or ""), roleWillChange and "warn" or "success")
+    end)
+    saveHost.Size, saveHost.Position = UDim2.fromOffset(130, 40), UDim2.new(1, -148, 0, 50)
+
+    label(settings, "LOADOUT", UDim2.fromOffset(100, 18), UDim2.fromOffset(18, 108), 11, THEME.ACCENT, Enum.Font.GothamBold)
+    local warrior = button(settings, "Warrior", ICONS.SHIELD, THEME.GREEN, function()
+        if setAutoEquipBuild("warrior") then UI.addLog("Loadout set to Warrior", "info") end
+    end)
+    warrior.Size, warrior.Position = UDim2.new(0.5, -24, 0, 40), UDim2.fromOffset(18, 132)
+    local mage = button(settings, "Mage", ICONS.BOLT, THEME.PURPLE, function()
+        if setAutoEquipBuild("mage") then UI.addLog("Loadout set to Mage", "info") end
+    end)
+    mage.Size, mage.Position = UDim2.new(0.5, -24, 0, 40), UDim2.new(0.5, 6, 0, 132)
+
+    local spoofInput = input(settings, "Display alias", SPOOFED_NAME)
+    spoofInput.Size, spoofInput.Position = UDim2.new(0.5, -24, 0, 40), UDim2.fromOffset(18, 194)
+    local titleInput = input(settings, "Overhead title", FAKE_TITLE.text)
+    titleInput.Size, titleInput.Position = UDim2.new(0.5, -24, 0, 40), UDim2.new(0.5, 6, 0, 194)
+    local applyIdentity = button(settings, "Apply identity", ICONS.EDIT, THEME.ACCENT_2, function()
+        local alias = spoofInput.Text:match("^%s*(.-)%s*$")
+        local titleText = titleInput.Text:match("^%s*(.-)%s*$")
+        if alias ~= "" then updateSpoofedName(alias) end
+        if titleText ~= "" then FAKE_TITLE.enabled, FAKE_TITLE.text = true, titleText; applyFakeTitleToCharacter(localPlayer.Character) end
+        UI.addLog("Identity settings applied", "success")
+    end)
+    applyIdentity.Size, applyIdentity.Position = UDim2.new(1, -36, 0, 40), UDim2.fromOffset(18, 250)
+
+    local activity = newPage("activity")
+    local logHeader = Instance.new("Frame")
+    logHeader.Size, logHeader.Parent = UDim2.new(1, 0, 0, 48), activity
+    cardSurface(logHeader, THEME.ACCENT_2, 16, true)
+    label(logHeader, "ACTIVITY", UDim2.fromOffset(180, 48), UDim2.fromOffset(16, 0), 13, THEME.ACCENT_2, Enum.Font.GothamBold)
+    local clear = button(logHeader, "Clear", ICONS.TRASH, THEME.ROSE)
+    clear.Size, clear.Position = UDim2.fromOffset(104, 32), UDim2.new(1, -112, 0, 8)
+    local logScroll = Instance.new("ScrollingFrame")
+    logScroll.Size, logScroll.Position = UDim2.new(1, 0, 1, -58), UDim2.fromOffset(0, 58)
+    logScroll.BorderSizePixel = 0
+    logScroll.ScrollBarThickness, logScroll.ScrollBarImageColor3, logScroll.AutomaticCanvasSize = 3, THEME.ACCENT, Enum.AutomaticSize.Y
+    logScroll.CanvasSize, logScroll.Parent = UDim2.new(), activity
+    cardSurface(logScroll, THEME.CYAN, 16, false); padding(logScroll, 12, 10)
+    local logLayout = Instance.new("UIListLayout")
+    logLayout.Padding, logLayout.Parent = UDim.new(0, 6), logScroll
+    local logRows = {}
+    addLogEntry = function(message, level)
+        if not logScroll.Parent then return end
+        local colors = { success = THEME.GREEN, warn = THEME.AMBER, danger = THEME.ROSE, info = THEME.CYAN }
+        local row = Instance.new("Frame")
+        row.Size, row.Parent = UDim2.new(1, -2, 0, 32), logScroll
+        cardSurface(row, colors[level] or THEME.ACCENT, 10, true)
+        local mark = Instance.new("Frame")
+        mark.Size, mark.Position, mark.BackgroundColor3, mark.Parent = UDim2.fromOffset(3, 16), UDim2.fromOffset(8, 8), colors[level] or THEME.ACCENT, row
+        corner(mark, 2)
+        label(row, os.date("%H:%M:%S"), UDim2.fromOffset(62, 32), UDim2.fromOffset(18, 0), 8, THEME.MUTED, Enum.Font.Code)
+        label(row, tostring(message), UDim2.new(1, -86, 1, 0), UDim2.fromOffset(80, 0), 9, THEME.TEXT, Enum.Font.Code)
+        table.insert(logRows, row)
+        if #logRows > 100 then table.remove(logRows, 1):Destroy() end
+        task.defer(function() logScroll.CanvasPosition = Vector2.new(0, math.max(0, logLayout.AbsoluteContentSize.Y)) end)
+        print("[AutoCarry] " .. tostring(message))
+    end
+    clear.MouseButton1Click:Connect(function()
+        for _, row in ipairs(logRows) do row:Destroy() end
+        table.clear(logRows)
+    end)
+
+    formatWithCommas = function(number)
+        local text = tostring(math.floor(tonumber(number) or 0))
+        while true do
+            local updated, count = text:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+            text = updated
+            if count == 0 then return text end
+        end
+    end
+
+    local function refreshStage()
+        local stage = STAGES[currentStage] or STAGES[1]
+        stageNumber.Text = string.format("%02d", currentStage)
+        stageName.Text = stage.map
+        stageTarget.Text = string.format("%s  /  TARGET LV.%d", stage.diff:upper(), stage.targetLvl)
+        if isHost then
+            currentLevelLabel.Text = targetState.ready
+                and string.format("LOWEST CLONE LV.%d", targetState.cloneLevel)
+                or "WAITING CLONE LV"
+        else
+            currentLevelLabel.Text = string.format("CURRENT LV.%d", getLocalLevel())
+        end
+        if collapsedStageLabel then
+            collapsedStageLabel.Text = string.format("STAGE %02d  •  LV.%d", currentStage, stage.targetLvl)
+        end
+        if stagePrevControl then
+            stagePrevControl.Active = currentStage > 1
+            stagePrevControl.ImageTransparency = currentStage > 1 and 0.05 or 0.72
+        end
+        if stageNextControl then
+            stageNextControl.Active = currentStage < #STAGES
+            stageNextControl.ImageTransparency = currentStage < #STAGES and 0.05 or 0.72
+        end
+    end
+
+    UI = {
+        setStatus = function(titleText, detailText, level)
+            statusTitle.Text, statusDetail.Text = titleText or "", detailText or ""
+            local color = level == "active" and THEME.GREEN or level == "warning" and THEME.AMBER or level == "danger" and THEME.ROSE or THEME.CYAN
+            tween(statusDot, { BackgroundColor3 = color }, 0.25)
+            tween(statusTitle, { TextColor3 = color }, 0.25)
+            collapsedState.Text = titleText or "Running"
+        end,
+        setCountdown = function(textValue, visible)
+            countdownBadge.Visible = visible == true and textValue ~= nil and textValue ~= ""
+            countdownBadge.Text = countdownBadge.Visible and textValue or ""
+        end,
+        setStage = function(index, level)
+            currentStage = math.clamp(tonumber(index) or currentStage, 1, #STAGES)
+            refreshStage()
+            local stage = STAGES[currentStage]
+            local current = tonumber(level) or (isHost and targetState.cloneLevel) or getLocalLevel()
+            if isHost then
+                currentLevelLabel.Text = targetState.ready
+                    and string.format("LOWEST CLONE LV.%d", current)
+                    or "WAITING CLONE LV"
+            else
+                currentLevelLabel.Text = string.format("CURRENT LV.%d", current)
+            end
+            local progress = math.clamp((current - stage.minLvl) / math.max(1, stage.targetLvl - stage.minLvl), 0, 1)
+            tween(stageProgressFill, { Size = UDim2.new(progress, 0, 1, 0) }, 0.55)
+        end,
+        setPlace = function(textValue, color) metricPlace.Text = textValue or ""; if color then metricPlace.TextColor3 = color end end,
+        setFlow = function(textValue, color) metricFlow.Text = textValue or ""; if color then metricFlow.TextColor3 = color end end,
+        updateGold = function(amount) if goldBalanceBadge then goldBalanceBadge.Text = "GOLD  " .. formatWithCommas(amount) end end,
+        updateGamepass = function(passId, owned, currentGold, cost, nextTarget, buying)
+            local card = passCards[passId]
+            if not card then return end
+            local state = buying and "buying" or owned and "owned" or nextTarget and "target" or "idle"
+            local color = state == "owned" and card.color or state == "buying" and THEME.AMBER or state == "target" and THEME.ACCENT or THEME.SUBTEXT
+            if buying then
+                card.badge.Text = card.name .. "  BUYING"
+            elseif owned then
+                card.badge.Text = card.name .. "  OWNED"
+            elseif nextTarget and cost and cost > 0 then
+                card.badge.Text = string.format("%s  %d%%", card.name, math.floor(math.clamp(currentGold / cost, 0, 1) * 100))
+            else
+                card.badge.Text = card.name
+            end
+            tween(card.badge, { TextColor3 = color }, 0.28)
+            tween(card.icon, { ImageColor3 = color, ImageTransparency = state == "idle" and 0.48 or 0 }, 0.28)
+            tween(card.miniIcon, { ImageColor3 = color, ImageTransparency = state == "idle" and 0.5 or 0 }, 0.28)
+            tween(card.stroke, { Color = color, Transparency = state == "idle" and 0.58 or 0.12 }, 0.28)
+            tween(card.miniStroke, { Color = color, Transparency = state == "idle" and 0.62 or 0.08 }, 0.28)
+            tween(card.chip, { BackgroundColor3 = state == "idle" and THEME.BG or THEME.CARD_HOVER }, 0.28)
+            tween(card.mini, { BackgroundColor3 = state == "idle" and THEME.BG or THEME.CARD }, 0.28)
+            if card.state ~= state and state == "owned" then
+                card.icon.Rotation, card.miniIcon.Rotation = -18, -18
+                tween(card.icon, { Rotation = 0 }, 0.5, Enum.EasingStyle.Back)
+                tween(card.miniIcon, { Rotation = 0 }, 0.5, Enum.EasingStyle.Back)
+            end
+            card.state = state
+        end,
+        addLog = function(message, level) addLogEntry(message, level) end,
+    }
+
+    refreshStage()
+    showPage("overview")
+    task.delay(0.7, function() if runtimeActive() and screen.Parent then setVisible(false) end end)
+end
+
+buildUserInterface()
+
+if ANTI_AFK_ENABLED then
+    task.spawn(function()
+        if getconnections then
+            pcall(function()
+                for _, connection in pairs(getconnections(localPlayer.Idled)) do
+                    if connection.Disable then
+                        connection:Disable()
+                    elseif connection.Disconnect then
+                        connection:Disconnect()
+                    end
+                end
+            end)
+        end
+
+        localPlayer.Idled:Connect(function()
+            if not runtimeActive() then return end
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(0, 0))
+            end)
+        end)
+    end)
+
+end
+
+task.spawn(function()
+    while runtimeActive() and task.wait(0.35) do
+        local inLobby = isInLobby()
+        local progress = getDungeonProgress()
+        if inLobby then
+            UI.setPlace("LOBBY", THEME.CYAN)
+        elseif progress == "in process" then
+            UI.setPlace("IN DUNGEON", THEME.GREEN)
+        elseif progress == "bosskilled" then
+            UI.setPlace("BOSS DEFEATED", THEME.AMBER)
+        else
+            UI.setPlace("LOADING STAGE", THEME.SUBTEXT)
+        end
+
+        if autoToggle then
+            if autoEquipRunning or inventoryAutomationBusy then
+            else
+                UI.setFlow(progress == "in process" and "DUNGEON ACTIVE" or "READY", THEME.PURPLE)
+            end
+        else
+            UI.setFlow("PAUSED", THEME.ROSE)
+        end
+
+        local curGold = getLocalGold()
+        UI.updateGold(curGold)
+
+    end
+end)
+
+task.spawn(function()
+    while runtimeActive() and task.wait(0.5) do
+        if isHost or not autoToggle or autoEquipRunning or inventoryAutomationBusy then continue end
+        local now = os.clock()
+        if now - autoSellBootAt >= CONFIG.AUTO_EQUIP_INITIAL_DELAY and now - lastAutoEquipAt >= CONFIG.AUTO_EQUIP_INTERVAL then
+            lastAutoEquipAt = now
+            startInventoryTask("equip", runAutoEquip)
+        end
+    end
+end)
+
+task.spawn(function()
+    while runtimeActive() and task.wait(1) do
+        if isHost or not autoToggle or autoSellRunning or inventoryAutomationBusy or os.clock() < nextAutoSellAllowedAt then continue end
+        local now = os.clock()
+        if now - autoSellBootAt >= CONFIG.AUTO_SELL_INITIAL_DELAY and now - lastAutoSellAt >= CONFIG.AUTO_SELL_INTERVAL then
+            lastAutoSellAt = now
+            startInventoryTask("sell", runAutoLevelSell)
+        end
+    end
+end)
+
+local function autoAddStaminaStats()
+    local spObj = localPlayer:FindFirstChild("skillPoints")
+    local pts = spObj and tonumber(spObj.Value) or 0
+    if pts > 0 then
+        local sent = fireRemote("spendSkillPoint", "stamina", pts)
+        if sent and UI then
+            UI.addLog(string.format("Assigned %d stat points to Stamina", pts), "success")
+        end
+        return sent
+    end
+    return false
+end
+
+task.spawn(function()
+    while runtimeActive() and task.wait(1.5) do
+        if not autoToggle then continue end
+        autoAddStaminaStats()
+    end
+end)
+
+task.spawn(function()
+    local spObj = localPlayer:WaitForChild("skillPoints", 10)
+    if spObj then
+        spObj.Changed:Connect(function(val)
+            if runtimeActive() and tonumber(val) and tonumber(val) > 0 and autoToggle then
+                task.wait(0.3)
+                autoAddStaminaStats()
+            end
+        end)
+    end
+end)
+
+local lastManualCombatInput = -math.huge
+UserInputService.InputBegan:Connect(function(input)
+    if not runtimeActive() then return end
+    if UserInputService:GetFocusedTextBox() then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+        or input.KeyCode == Enum.KeyCode.Q
+        or input.KeyCode == Enum.KeyCode.E then
+        lastManualCombatInput = os.clock()
+    end
+end)
+
+local function manualCombatIsActive()
+    return os.clock() - lastManualCombatInput < CONFIG.MANUAL_COMBAT_GRACE
+        or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+        or UserInputService:IsKeyDown(Enum.KeyCode.Q)
+        or UserInputService:IsKeyDown(Enum.KeyCode.E)
+end
+
+local function findAbilityTool(slot)
+    local containers = { localPlayer:FindFirstChildOfClass("Backpack"), localPlayer.Character }
+    for _, container in ipairs(containers) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                local abilitySlot = item:IsA("Tool") and item:FindFirstChild("abilitySlot")
+                if abilitySlot and tostring(abilitySlot.Value) == slot then return item end
+            end
+        end
+    end
+    return nil
+end
+
+local nextAbilityCastAt = { q = -math.huge, e = -math.huge }
+local function castAbilitySafely(slot)
+    if isHost then return false end
+    local now = os.clock()
+    if now < nextAbilityCastAt[slot] or manualCombatIsActive() then return false end
+    local char = localPlayer.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    local busy = char and char:FindFirstChild("busyCasting")
+    if not humanoid or humanoid.Health <= 0 or (busy and busy.Value == true) then return false end
+    local tool = findAbilityTool(slot)
+    if not tool then return false end
+    local cooldown = tool:FindFirstChild("cooldown")
+    if cooldown and tonumber(cooldown.Value) and tonumber(cooldown.Value) > 0 then return false end
+    local actionRemote = tool:FindFirstChild("abilityEvent") or tool:FindFirstChild("spellEvent")
+    local abilityUsed = getRemote("abilityUsed", "RemoteEvent")
+    if not actionRemote or not actionRemote:IsA("RemoteEvent") or not abilityUsed then return false end
+    nextAbilityCastAt[slot] = now + CONFIG.AUTO_SKILL_RETRY_DELAY
+    local ok, err = pcall(function()
+        actionRemote:FireServer()
+        abilityUsed:FireServer(slot, tool)
+    end)
+    if not ok then reportRemoteProblem("autoSkill:" .. slot, tostring(err)) end
+    return ok
+end
+
+task.spawn(function()
+    local slots, slotIndex = { "q", "e" }, 1
+    while runtimeActive() and task.wait(CONFIG.AUTO_SKILL_INTERVAL) do
+        if isHost or not autoToggle or not autoSkillEnabled or isInLobby() or inventoryAutomationBusy or manualCombatIsActive() then continue end
+        castAbilitySafely(slots[slotIndex])
+        slotIndex = slotIndex == #slots and 1 or slotIndex + 1
+    end
+end)
+
+local playerLevelCache = setmetatable({}, { __mode = "k" })
+
+local function readReplicatedPlayerLevel(plr)
+    if not plr then return 0 end
+    -- Prefer the replicated stat when available.
+    local ls = plr:FindFirstChild("leaderstats")
+    local lvlObj = ls and ls:FindFirstChild("Level")
+    if lvlObj then
+        local ok, value = pcall(function() return tonumber(lvlObj.Value) end)
+        if ok and value and value > 0 then return value end
+    end
+
+    -- In some dungeon sessions leaderstats is not retained on every client,
+    -- but remoteGuiHandler copies the exact level into this teammate frame.
+    local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+    local playerStatus = playerGui and playerGui:FindFirstChild("playerStatus")
+    local frame = playerStatus and playerStatus:FindFirstChild("Frame")
+    local holder = frame and frame:FindFirstChild("teammateHolder")
+    local teammate = holder and (holder:FindFirstChild(plr.Name)
+        or holder:FindFirstChild((playerRealNames and playerRealNames[plr]) or ""))
+    local levelBorder = teammate and teammate:FindFirstChild("levelBorder")
+    local levelLabel = levelBorder and levelBorder:FindFirstChild("level")
+    if levelLabel and levelLabel:IsA("TextLabel") then
+        local value = tonumber(tostring(levelLabel.Text):match("%d+"))
+        if value and value > 0 then return value end
+    end
+
+    -- Final live fallback: the clone's replicated overhead level. Restrict the
+    -- lookup to objects whose hierarchy explicitly says level/lvl so HP/EXP
+    -- numbers can never be mistaken for a level.
+    local character = plr.Character
+    if character then
+        for _, desc in ipairs(character:GetDescendants()) do
+            if desc:IsA("TextLabel") then
+                local lineage = string.lower(table.concat({
+                    tostring(desc.Name),
+                    desc.Parent and tostring(desc.Parent.Name) or "",
+                    desc.Parent and desc.Parent.Parent and tostring(desc.Parent.Parent.Name) or "",
+                }, "/"))
+                if string.find(lineage, "level", 1, true) or string.find(lineage, "lvl", 1, true) then
+                    local value = tonumber(tostring(desc.Text):match("%d+"))
+                    if value and value > 0 then return value end
+                end
+            end
+        end
+    end
+
+    return 0
+end
+
+local function getPlayerLevel(plr)
+    local current = readReplicatedPlayerLevel(plr)
+    if current > 0 then
+        playerLevelCache[plr] = current
+        return current
+    end
+    return tonumber(playerLevelCache[plr]) or 0
+end
+
+-- Keep a level observation alive independently of the party-container race.
+-- This also covers scripts injected after the players/characters already exist.
+task.spawn(function()
+    while runtimeActive() and task.wait(0.2) do
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local level = readReplicatedPlayerLevel(plr)
+            if level > 0 then playerLevelCache[plr] = level end
+        end
+    end
+end)
+
+local cloneMemoryState = {
+    lastFile = "AutoCarry_LastDungeonClones.json",
+    remembered = {},
+}
+
+function cloneMemoryState.load()
+    cloneMemoryState.remembered = {}
+    local ok, decoded = pcall(function()
+        if isfile and isfile(cloneMemoryState.lastFile) and readfile then
+            return HttpService:JSONDecode(readfile(cloneMemoryState.lastFile))
+        end
+    end)
+    if ok and type(decoded) == "table" and type(decoded.clones) == "table" then
+        for _, record in ipairs(decoded.clones) do
+            if type(record) == "table" then
+                local name = tostring(record.name or ""):match("^%s*(.-)%s*$")
+                if name ~= "" then
+                    cloneMemoryState.remembered[string.lower(name)] = { name = name, level = math.max(0, tonumber(record.level) or 0) }
+                end
+            end
+        end
+    end
+end
+
+function cloneMemoryState.save()
+    pcall(function()
+        if not writefile then return end
+        local list = {}
+        for _, v in pairs(cloneMemoryState.remembered) do table.insert(list, v) end
+        table.sort(list, function(a, b) return tostring(a.name) < tostring(b.name) end)
+        writefile(cloneMemoryState.lastFile, HttpService:JSONEncode({ clones = list, stage = currentStage }))
+    end)
+end
+
+function cloneMemoryState.lowest()
+    local list = {}
+    for _, v in pairs(cloneMemoryState.remembered) do table.insert(list, v) end
+    table.sort(list, function(a, b) return (tonumber(a.level) or 0) < (tonumber(b.level) or 0) end)
+    return list[1], #list
+end
+
+-- Human-readable persistent roster. Each data row is:
+-- RobloxName<TAB>LastLevel<TAB>MissedMatches
+local cloneRoster = {
+    file = "AutoCarry_CloneRoster.txt",
+    entries = {},
+}
+
+function cloneRoster.load()
+    cloneRoster.entries = {}
+    pcall(function()
+        if not (isfile and readfile and isfile(cloneRoster.file)) then return end
+        for line in string.gmatch(readfile(cloneRoster.file), "[^\r\n]+") do
+            local name, level, missed = line:match("^([^\t]+)\t(%d+)\t(%d+)$")
+            if name and name ~= "" then
+                cloneRoster.entries[string.lower(name)] = {
+                    name = name,
+                    level = math.max(0, tonumber(level) or 0),
+                    missedMatches = math.max(0, tonumber(missed) or 0),
+                }
+            end
+        end
+    end)
+end
+
+function cloneRoster.save()
+    pcall(function()
+        if not writefile then return end
+        local list = {}
+        for _, entry in pairs(cloneRoster.entries) do table.insert(list, entry) end
+        table.sort(list, function(a, b)
+            local aLevel, bLevel = tonumber(a.level) or 0, tonumber(b.level) or 0
+            if aLevel ~= bLevel then return aLevel < bLevel end
+            return string.lower(a.name) < string.lower(b.name)
+        end)
+        local lines = {
+            "# AutoCarry Clone Roster",
+            "# Name\tLast Level\tMissed Matches",
+        }
+        for _, entry in ipairs(list) do
+            table.insert(lines, string.format("%s\t%d\t%d", entry.name, tonumber(entry.level) or 0, tonumber(entry.missedMatches) or 0))
+        end
+        writefile(cloneRoster.file, table.concat(lines, "\n") .. "\n")
+    end)
+end
+
+function cloneRoster.lowest()
+    local list = {}
+    for _, entry in pairs(cloneRoster.entries) do table.insert(list, entry) end
+    table.sort(list, function(a, b)
+        local aLevel, bLevel = tonumber(a.level) or 0, tonumber(b.level) or 0
+        if aLevel ~= bLevel then return aLevel < bLevel end
+        return string.lower(a.name) < string.lower(b.name)
+    end)
+    return list[1], #list
+end
+
+function cloneRoster.remove(name)
+    local key = string.lower(tostring(name or ""))
+    if cloneRoster.entries[key] then
+        cloneRoster.entries[key] = nil
+        cloneRoster.save()
+        return true
+    end
+    return false
+end
+
+-- `participants` is keyed by lower-case Roblox name with `{ name, level }`.
+-- Missing roster entries age by one completed dungeon; three absences remove
+-- them. A clone that completes the dungeon is reset to zero missed matches.
+function cloneRoster.recordCompletedMatch(participants)
+    local removed = {}
+    for key, entry in pairs(cloneRoster.entries) do
+        local participant = participants[key]
+        if participant then
+            entry.name = participant.name
+            entry.level = participant.level
+            entry.missedMatches = 0
+        else
+            entry.missedMatches = (tonumber(entry.missedMatches) or 0) + 1
+            if entry.missedMatches >= CONFIG.ROSTER_MAX_MISSED_MATCHES then
+                table.insert(removed, entry.name)
+                cloneRoster.entries[key] = nil
+            end
+        end
+    end
+    for key, participant in pairs(participants) do
+        if not cloneRoster.entries[key] then
+            cloneRoster.entries[key] = {
+                name = participant.name,
+                level = participant.level,
+                missedMatches = 0,
+            }
+        end
+    end
+    cloneRoster.save()
+    return removed
+end
+
+local function getPlayerByNameInsensitive(name)
+    local wanted = string.lower(tostring(name or ""))
+    if wanted == "" then return nil end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local rName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+        if string.lower(rName) == wanted then return plr end
+    end
+    return nil
+end
+
+local function getReadyDungeonCloneCounts()
+    local ready, connected = 0, 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= localPlayer then
+            connected = connected + 1
+            local char = plr.Character
+            local characterLoaded = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildOfClass("Humanoid"))
+            if characterLoaded and getPlayerLevel(plr) > 0 then
+                ready = ready + 1
+            end
+        end
+    end
+    return ready, connected
+end
+
+-- Live level always wins while clones are present. The persisted roster is a
+-- lobby fallback while leaderstats are being re-created after a dungeon; the
+-- start gate below still requires that roster clone to be physically present.
+local function getLowestConnectedCloneLevel()
+    local lowestLevel, lowestName, connected = nil, nil, 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= localPlayer then
+            connected = connected + 1
+            local level = getPlayerLevel(plr)
+            if level > 0 and (not lowestLevel or level < lowestLevel) then
+                lowestLevel = level
+                lowestName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+            end
+        end
+    end
+    return lowestLevel, lowestName, connected
+end
+
+-- Map selection reads the host-maintained roster snapshot only. The snapshot
+-- is written at dungeon entry, never seeded from arbitrary lobby/workspace
+-- players, so an old clone cannot become a target merely by being nearby.
+local function getAuthoritativeCloneTarget()
+    if batchDiscovery.active then
+        -- A new batch is deliberately learned only from join requests received
+        -- after the reset. Never scan arbitrary old workspace players here.
+        local discovered = {}
+        for key, name in pairs(batchDiscovery.candidates) do
+            local plr = getPlayerByNameInsensitive(name)
+            local liveLevel = plr and getPlayerLevel(plr) or 0
+            if liveLevel > 0 then
+                local liveName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+                discovered[key] = { name = liveName, level = liveLevel, missedMatches = 0 }
+            end
+        end
+        if next(discovered) then
+            -- Fast-new-batch exception: the host may already be inside the
+            -- LV.1 dungeon when clones arrive, so capture those explicitly
+            -- accepted joiners immediately rather than waiting for the next
+            -- dungeon transition.
+            cloneRoster.entries = discovered
+            cloneRoster.save()
+            batchDiscovery.active = false
+            batchDiscovery.startWithoutLobbyClones = false
+            batchDiscovery.candidates = {}
+            local lowest = cloneRoster.lowest()
+            if UI then UI.addLog("New clone batch captured after host start", "success") end
+            return lowest and lowest.level, lowest and lowest.name, lowest ~= nil
+        end
+        return nil, nil, false
+    end
+
+    local saved = cloneRoster.lowest()
+    if saved and (tonumber(saved.level) or 0) > 0 then
+        return saved.level, saved.name, false
+    end
+    return nil, nil, false
+end
+
+local function getStageForCloneLevel(level)
+    local selected = 1
+    for index, stage in ipairs(STAGES) do
+        if level >= stage.minLvl then selected = index else break end
+    end
+    return selected
+end
+
+local function clearCloneTarget()
+    local wasReady = targetState.ready
+    targetState.ready = false
+    targetState.stageIndex = nil
+    targetState.cloneLevel = nil
+    targetState.cloneName = nil
+    targetState.lastLiveAt = -math.huge
+    if wasReady and UI then UI.setStage(currentStage, 0) end
+end
+
+clearCloneData = function()
+    if not isHost then return false end
+
+    -- Keep an empty, readable roster file rather than relying on delfile,
+    -- which is unavailable in some executors. The clone-memory file is also
+    -- rewritten empty, and the stage file becomes the LV.1 bootstrap map.
+    cloneRoster.entries = {}
+    cloneMemoryState.remembered = {}
+    currentStage = 1
+    targetState.ready = true
+    targetState.stageIndex = 1
+    targetState.cloneLevel = 0
+    targetState.cloneName = "New batch"
+    targetState.lastLiveAt = os.clock()
+    targetState.revision = targetState.revision + 1
+    batchDiscovery.active = true
+    batchDiscovery.bootstrapAwaitingDungeon = true
+    batchDiscovery.startWithoutLobbyClones = true
+    batchDiscovery.candidates = {}
+    cloneRoster.save()
+    cloneMemoryState.save()
+    saveStage()
+    onCloneDataCleared()
+
+    if UI then
+        UI.setStage(1, 0)
+        UI.setStatus("NEW BATCH", "Opening Stage 1; host will start without waiting for clones", "warning")
+        UI.setCountdown("Starting shortly", true)
+        UI.addLog("Clone data cleared; stage reset to Desert Temple Easy", "warn")
+    end
+    return true
+end
+
+local function applyTargetToLobby()
+    if not isHost or not targetState.ready or not targetState.stageIndex then return false end
+    if currentStage == targetState.stageIndex then return false end
+    currentStage = targetState.stageIndex
+    UI.setStage(currentStage, targetState.cloneLevel)
+    saveStage()
+    return true
+end
+
+local function syncStageFromLowestCloneLevel(lowestLevel, lowestName)
+    if not isHost or not lowestLevel or lowestLevel <= 0 then return false end
+
+    local resolvedName = lowestName or targetState.cloneName or "clone"
+    local desiredStage = getStageForCloneLevel(lowestLevel)
+    local targetChanged = not targetState.ready
+        or targetState.stageIndex ~= desiredStage
+        or targetState.cloneLevel ~= lowestLevel
+        or targetState.cloneName ~= resolvedName
+
+    targetState.ready = true
+    targetState.stageIndex = desiredStage
+    targetState.cloneLevel = lowestLevel
+    targetState.cloneName = resolvedName
+    targetState.lastLiveAt = os.clock()
+
+    -- The target card follows the lowest clone immediately in both lobby and
+    -- dungeon. Only `activeStageIndex` remains fixed until the current run
+    -- ends, so the server map itself is never switched mid-dungeon.
+    local displayedChanged = currentStage ~= desiredStage
+    if displayedChanged then
+        currentStage = desiredStage
+        UI.setStage(currentStage, lowestLevel)
+        saveStage()
+    end
+    if targetChanged or displayedChanged then
+        targetState.revision = targetState.revision + 1
+        UI.addLog(string.format("Clone target applied: %s LV.%d -> %s (%s)", resolvedName, lowestLevel, STAGES[desiredStage].map, STAGES[desiredStage].diff), "success")
+    end
+    return targetChanged or displayedChanged, desiredStage
+end
+
+local function getHostQueueLobby(containerName)
+    local games = workspace:FindFirstChild("games")
+    local container = games and games:FindFirstChild(containerName)
+    if not container then return nil end
+
+    -- Exact findLobby implementation from queue.lua/lobbyInfo.lua: search only
+    -- direct room children. Never descend into mapName.private (the whitelist).
+    local localActualKey = string.lower(tostring(localPlayer.Name))
+    local localRealKey = string.lower(tostring((playerRealNames and playerRealNames[localPlayer]) or localPlayer.Name))
+    for _, gameLobby in ipairs(container:GetChildren()) do
+        for _, member in ipairs(gameLobby:GetChildren()) do
+            local nodeKey = string.lower(tostring(member.Name))
+            if nodeKey == localActualKey or nodeKey == localRealKey then return gameLobby end
+        end
+    end
+    return nil
+end
+
+local function getLowestHostLobbyCloneLevel()
+    local gameLobby = getHostQueueLobby("inLobby")
+    if not gameLobby then return nil, nil end
+
+    local lowestLevel, lowestName = nil, nil
+
+    -- populateLobby in the supplied source prefers this server-authored JSON
+    -- attribute. It already carries username (`n`) and exact level (`l`).
+    local encodedRoster = gameLobby:GetAttribute("Roster")
+    if type(encodedRoster) == "string" then
+        local ok, roster = pcall(HttpService.JSONDecode, HttpService, encodedRoster)
+        if ok and type(roster) == "table" then
+            for _, entry in ipairs(roster) do
+                local name = type(entry) == "table" and tostring(entry.n or "") or ""
+                local level = type(entry) == "table" and tonumber(entry.l) or nil
+                if name ~= "" and string.lower(name) ~= string.lower(localPlayer.Name)
+                    and level and level > 0 and (not lowestLevel or level < lowestLevel) then
+                    lowestLevel, lowestName = level, name
+                end
+            end
+            if lowestLevel then return lowestLevel, lowestName end
+        end
+    end
+
+    -- Compatibility fallback mirrors lobbyInfo.lua's direct StringValue path.
+    for _, member in ipairs(gameLobby:GetChildren()) do
+        if member:IsA("StringValue") and member.Name ~= "mapName" then
+            local plr = Players:FindFirstChild(member.Name)
+            if plr and plr ~= localPlayer then
+                local level = getPlayerLevel(plr)
+                if level > 0 and (not lowestLevel or level < lowestLevel) then
+                    lowestLevel, lowestName = level, tostring(plr.Name)
+                end
+            end
+        end
+    end
+    return lowestLevel, lowestName
+end
+
+-- Inside a Level server, Players:GetPlayers() is the participant authority.
+-- `ready` is intentionally not required: the live game may omit it after the
+-- loading phase even though the clone and its teammate UI are fully present.
+local function snapshotHostDungeonRoster()
+    local snapshot = {}
+    local connected, resolved, initialized = 0, 0, 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= localPlayer then
+            connected = connected + 1
+            local char = plr.Character
+            if char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildOfClass("Humanoid")) then
+                initialized = initialized + 1
+            end
+            local realName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+            local actualKey = string.lower(tostring(plr.Name))
+            local realKey = string.lower(realName)
+            local level = getPlayerLevel(plr)
+            local hasResolvedLevel = level > 0
+            local previous = cloneRoster.entries[realKey] or cloneRoster.entries[actualKey]
+            if level <= 0 and previous then level = tonumber(previous.level) or 0 end
+            if level > 0 then
+                if hasResolvedLevel then resolved = resolved + 1 end
+                snapshot[string.lower(realName)] = {
+                    name = realName,
+                    level = level,
+                    missedMatches = 0,
+                }
+            end
+        end
+    end
+
+    -- Never destroy the previous valid target because the party or leaderstats
+    -- happened to replicate one frame later than the dungeon transition.
+    if not next(snapshot) then return nil, false, false, connected, resolved, initialized end
+    local snapshotChanged = false
+    for key, entry in pairs(snapshot) do
+        local old = cloneRoster.entries[key]
+        if not old or old.name ~= entry.name or tonumber(old.level) ~= tonumber(entry.level)
+            or (tonumber(old.missedMatches) or 0) ~= 0 then
+            snapshotChanged = true
+            break
+        end
+    end
+    if not snapshotChanged then
+        for key, _ in pairs(cloneRoster.entries) do
+            if not snapshot[key] then
+                snapshotChanged = true
+                break
+            end
+        end
+    end
+    if snapshotChanged then
+        cloneRoster.entries = snapshot
+        cloneRoster.save()
+    end
+    local censusComplete = connected > 0 and resolved >= connected and initialized >= connected
+    return cloneRoster.lowest(), true, censusComplete, connected, resolved, initialized
+end
+
+local WEBHOOK_GAMEPASSES = {
+    { id = "vip",               label = "VIP",              icon = "👑" },
+    { id = "goldGamepass",      label = "2x Gold",          icon = "🪙" },
+    { id = "extraItemGamepass", label = "+1 Item",          icon = "🎁" },
+    { id = "freeStatResets",    label = "Free Stat Resets", icon = "🔄" },
+}
+
+local function discordSafeText(value)
+    return tostring(value or "?"):gsub("`", "'"):gsub("@", "＠")
+end
+
+local function cloneGamepassSummary(name)
+    local plr = getPlayerByNameInsensitive(name)
+    if not plr then return "⚪ Offline / chưa đồng bộ" end
+
+    local owned, checked = {}, false
+    for _, pass in ipairs(WEBHOOK_GAMEPASSES) do
+        local value = plr:FindFirstChild(pass.id)
+        local attribute = plr:GetAttribute(pass.id)
+        if value and value:IsA("ValueBase") then
+            checked = true
+            if value.Value == true then table.insert(owned, pass.icon .. " " .. pass.label) end
+        elseif attribute ~= nil then
+            checked = true
+            if attribute == true then table.insert(owned, pass.icon .. " " .. pass.label) end
+        end
+    end
+    if #owned > 0 then return table.concat(owned, " • ") end
+    return checked and "— Không sở hữu gamepass đã kiểm tra" or "⚪ Chưa có dữ liệu gamepass"
+end
+
+local function getWebhookRequest()
+    if syn and type(syn.request) == "function" then return syn.request end
+    if type(http_request) == "function" then return http_request end
+    if type(request) == "function" then return request end
+    if http and type(http.request) == "function" then return http.request end
+    return nil
+end
+
+local function sendDungeonRosterWebhook(stageIndex)
+    if not isHost or not DISCORD_WEBHOOK_ENABLED or DISCORD_WEBHOOK_URL == "" then return end
+
+    task.spawn(function()
+        local sender = getWebhookRequest()
+        if not sender then
+            if UI then UI.addLog("Discord webhook unavailable in this executor", "warn") end
+            return
+        end
+
+        local roster = {}
+        for _, entry in pairs(cloneRoster.entries) do table.insert(roster, entry) end
+        table.sort(roster, function(a, b)
+            local aLevel, bLevel = tonumber(a.level) or 0, tonumber(b.level) or 0
+            if aLevel ~= bLevel then return aLevel < bLevel end
+            return string.lower(a.name) < string.lower(b.name)
+        end)
+
+        local stage = STAGES[stageIndex] or STAGES[currentStage] or STAGES[1]
+        local lowest = roster[1]
+        local fields = {
+            {
+                name = "⚔️ DUNGEON",
+                value = string.format("**%s** — `%s`\nTarget **LV.%d**\nMode: `%s`", stage.map, stage.diff, stage.targetLvl, HARDCORE_ENABLED and "HARDCORE" or "NORMAL"),
+                inline = true,
+            },
+            {
+                name = "🎯 LOWEST ROSTER",
+                value = lowest and string.format("**%s**\nLV.%d", discordSafeText(lowest.name), tonumber(lowest.level) or 0) or "No clone captured",
+                inline = true,
+            },
+        }
+
+        local chunk, chunkNumber = "", 1
+        local function flushChunk()
+            if chunk == "" then return end
+            table.insert(fields, {
+                name = string.format("👥 CLONE ROSTER %02d", chunkNumber),
+                value = chunk,
+                inline = false,
+            })
+            chunk, chunkNumber = "", chunkNumber + 1
+        end
+
+        for index, entry in ipairs(roster) do
+            local line = string.format("`%02d` **%s**  •  **LV.%d**\n%s", index, discordSafeText(entry.name), tonumber(entry.level) or 0, cloneGamepassSummary(entry.name))
+            if #chunk > 0 and #chunk + #line + 1 > 900 then flushChunk() end
+            chunk = chunk == "" and line or (chunk .. "\n" .. line)
+        end
+        flushChunk()
+        if #roster == 0 then
+            table.insert(fields, { name = "👥 CLONE ROSTER", value = "No clone was captured for this dungeon.", inline = false })
+        end
+
+        local timestamp = nil
+        pcall(function() timestamp = DateTime.now():ToIsoDate() end)
+        local payload = {
+            username = "AUTO CARRY • HOST",
+            allowed_mentions = { parse = {} },
+            embeds = {{
+                title = "✦ DUNGEON ROSTER REPORT",
+                description = "Host roster report after dungeon completion.",
+                color = 1356006,
+                fields = fields,
+                footer = { text = "AUTO CARRY  •  Host: " .. discordSafeText(realPlayerName) },
+                timestamp = timestamp,
+            }},
+        }
+
+        local ok, response = pcall(sender, {
+            Url = DISCORD_WEBHOOK_URL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+        local statusCode = type(response) == "table" and (response.StatusCode or response.Status) or nil
+        if ok and (not statusCode or (statusCode >= 200 and statusCode < 300)) then
+            if UI then UI.addLog("Discord roster webhook sent", "success") end
+        elseif UI then
+            UI.addLog("Discord roster webhook failed", "warn")
+        end
+    end)
+end
+
+function cloneMemoryState.runHost()
+    cloneMemoryState.load()
+    cloneRoster.load()
+    -- Host owns this file. Create the readable empty roster on first launch
+    -- as well, so clone clients never need to create one.
+    cloneRoster.save()
+
+    -- A transition/reload can briefly remove every clone's leaderstats. Seed
+    -- the displayed/pending lobby map from the roster in that window so it
+    -- remains the same target that was used in the dungeon. A live resolver
+    -- below immediately replaces this with the clone's current level.
+    local savedTarget = cloneRoster.lowest()
+    if savedTarget and (tonumber(savedTarget.level) or 0) > 0 then
+        syncStageFromLowestCloneLevel(savedTarget.level, savedTarget.name)
+    else
+        -- First batch has no roster yet. Open a harmless LV.1 bootstrap lobby,
+        -- accept a clone, then create the roster only when the party enters
+        -- the first dungeon.
+        currentStage = 1
+        targetState.ready = true
+        targetState.stageIndex = 1
+        targetState.cloneLevel = 0
+        targetState.cloneName = "Awaiting first roster"
+        targetState.lastLiveAt = os.clock()
+        batchDiscovery.active = true
+        batchDiscovery.bootstrapAwaitingDungeon = true
+        batchDiscovery.startWithoutLobbyClones = false
+        batchDiscovery.candidates = {}
+        saveStage()
+    end
+
+    local hostState = {
+        isReplaying = false,
+        -- This stays fixed for the dungeon already in progress. `currentStage`
+        -- may advance while a clone levels up, and then represents the next lobby.
+        activeStageIndex = currentStage,
+        lastJoinActivityAt = os.clock(),
+        lastLobbyCreateAt = -math.huge,
+        lobbyCreatedSuccessfully = false,
+        -- The room's map is captured here. `currentStage` can change after a
+        -- clone joins, but that change must apply to the following lobby.
+        lobbyStageIndex = currentStage,
+        lobbyStartRequested = false,
+        needsLobbyRebuild = false,
+        autoStartedDone = false,
+        requiredCloneWaitStartedAt = nil,
+        rosterRequiredWaitStartedAt = nil,
+        rosterFinishRecorded = false,
+        webhookSentForMatch = false,
+        -- Remains true until a non-empty, level-resolved dungeon snapshot is
+        -- committed. It is intentionally independent of the old roster state.
+        rosterSnapshotPending = isInDungeon(),
+        rosterRefreshUntil = isInDungeon() and (os.clock() + 15) or -math.huge,
+        lastRosterDetectionSignature = nil,
+        censusConnected = 0,
+        censusLevels = 0,
+        censusCharacters = 0,
+        acceptedRequestIds = {},
+        pendingJoinRequests = {},
+    }
+
+    onCloneDataCleared = function()
+        hostState.lobbyStartRequested = false
+        hostState.lobbyCreatedSuccessfully = false
+        hostState.lobbyStageIndex = nil
+        hostState.needsLobbyRebuild = false
+        hostState.lastLobbyCreateAt = os.clock()
+        hostState.rosterRequiredWaitStartedAt = nil
+        hostState.rosterSnapshotPending = isInDungeon()
+        hostState.rosterRefreshUntil = isInDungeon() and (os.clock() + 15) or -math.huge
+        hostState.lastRosterDetectionSignature = nil
+        hostState.censusConnected = 0
+        hostState.censusLevels = 0
+        hostState.censusCharacters = 0
+
+        -- If an old high-level room is still open, close it now. The normal
+        -- lobby loop will rebuild Desert Temple Easy from `currentStage = 1`.
+        if isInLobby() then
+            local closed = fireRemote("leaveGame")
+            if not closed then fireRemote("ReturnToLobbyEvent") end
+        end
+    end
+
+    local function getRequiredRosterClone()
+        local record = cloneRoster.lowest()
+        if not record then return nil, nil, false end
+        local plr = getPlayerByNameInsensitive(record.name)
+        local replicatedLevel = plr and getPlayerLevel(plr) or 0
+        local char = plr and plr.Character
+        local isReady = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildOfClass("Humanoid"))
+            and replicatedLevel > 0
+        return record, plr, isReady == true
+    end
+
+    local function recordRosterCompletion()
+        if hostState.rosterFinishRecorded then return end
+        hostState.rosterFinishRecorded = true
+        -- Membership is frozen from dungeon entry; only refresh Levels for
+        -- those same recorded clones after the run, then persist the host
+        -- roster before calculating the next lobby target.
+        local changed = false
+        for _, entry in pairs(cloneRoster.entries) do
+            local plr = getPlayerByNameInsensitive(entry.name)
+            local liveLevel = plr and getPlayerLevel(plr) or 0
+            if liveLevel > 0 and entry.level ~= liveLevel then
+                entry.level = liveLevel
+                changed = true
+            end
+        end
+        if changed then cloneRoster.save() end
+    end
+
+    local function sendCompletionWebhookOnce()
+        if hostState.webhookSentForMatch then return end
+        hostState.webhookSentForMatch = true
+        sendDungeonRosterWebhook(hostState.activeStageIndex)
+    end
+
+    local lastLobbyRetargetAt = -math.huge
+    local function abandonMismatchedLobby()
+        if not hostState.lobbyCreatedSuccessfully or not targetState.ready then return end
+        if hostState.lobbyStageIndex == targetState.stageIndex then return end
+        if os.clock() - lastLobbyRetargetAt < 2 then return end
+
+        lastLobbyRetargetAt = os.clock()
+        hostState.lobbyCreatedSuccessfully = false
+        hostState.lobbyStartRequested = false
+        hostState.lobbyStageIndex = nil
+        hostState.lastLobbyCreateAt = os.clock()
+
+        -- The supplied game source uses `leaveGame` to close an open lobby.
+        -- Retain the older remote as a compatibility fallback.
+        local closed = fireRemote("leaveGame")
+        if not closed then fireRemote("ReturnToLobbyEvent") end
+        UI.addLog("Lobby target changed; rebuilding for the lowest clone", "warn")
+    end
+
+    -- The roster keeps the target stable during transitions. It is only
+    -- replaced by `snapshotHostDungeonRoster` at the next dungeon entry.
+    task.spawn(function()
+        while runtimeActive() and task.wait(CONFIG.TARGET_SYNC_INTERVAL) do
+            -- Reconcile against the exact participant source used by the
+            -- dungeon ready UI. An incomplete census remains pending.
+            if isInDungeon() and (hostState.rosterSnapshotPending or os.clock() < hostState.rosterRefreshUntil) then
+                local capturedLowest, captured, censusComplete, connected, resolved, initialized = snapshotHostDungeonRoster()
+                hostState.censusConnected = connected or 0
+                hostState.censusLevels = resolved or 0
+                hostState.censusCharacters = initialized or 0
+                if captured and capturedLowest then
+                    hostState.rosterSnapshotPending = not censusComplete
+                    batchDiscovery.active = false
+                    batchDiscovery.bootstrapAwaitingDungeon = false
+                    batchDiscovery.startWithoutLobbyClones = false
+                    local changed = syncStageFromLowestCloneLevel(capturedLowest.level, capturedLowest.name)
+                    local signature = string.lower(capturedLowest.name) .. ":" .. tostring(capturedLowest.level)
+                    if changed or signature ~= hostState.lastRosterDetectionSignature then
+                        hostState.lastRosterDetectionSignature = signature
+                        UI.addLog(string.format("Clone detected in dungeon: %s LV.%d", capturedLowest.name, capturedLowest.level), "success")
+                    end
+                end
+            end
+            local targetLevel, targetName, targetIsLive = getAuthoritativeCloneTarget()
+            if targetLevel then
+                if targetIsLive then
+                    cloneMemoryState.remembered[string.lower(targetName)] = { name = targetName, level = targetLevel }
+                end
+                local changed = syncStageFromLowestCloneLevel(targetLevel, targetName)
+                if changed and isInLobby() then
+                    abandonMismatchedLobby()
+                end
+            else
+                if not batchDiscovery.active and not batchDiscovery.bootstrapAwaitingDungeon
+                    and (not targetState.ready or os.clock() - targetState.lastLiveAt >= CONFIG.CLONE_TARGET_GRACE) then
+                    clearCloneTarget()
+                end
+            end
+        end
+    end)
+
+    canHostStartMatch = function()
+        -- Lobby has one job: build the selected room and start it. Clone
+        -- discovery/readiness is handled after entry, inside the dungeon.
+        if hostState.lobbyCreatedSuccessfully and hostState.lobbyStageIndex ~= targetState.stageIndex then
+            return false, "retargeting lobby for lowest clone"
+        end
+        return true
+    end
+
+    local function buttonCaption(button)
+        if button:IsA("TextButton") then return string.lower(tostring(button.Text)) end
+        for _, desc in ipairs(button:GetDescendants()) do
+            if desc:IsA("TextLabel") and desc.Text ~= "" then
+                return string.lower(tostring(desc.Text))
+            end
+        end
+        return ""
+    end
+
+    local function isJoinRequestAcceptButton(button)
+        if not (button:IsA("TextButton") or button:IsA("ImageButton")) or not button.Visible then return false end
+        local caption = buttonCaption(button):match("^%s*(.-)%s*$")
+        if caption ~= "accept" then return false end
+
+        -- Require the request dialog context so unrelated Accept/Confirm buttons
+        -- elsewhere in the game's UI are never pressed.
+        local node = button.Parent
+        while node and not node:IsA("PlayerGui") do
+            for _, desc in ipairs(node:GetDescendants()) do
+                if desc:IsA("TextLabel") and string.find(string.lower(tostring(desc.Text)), "join request", 1, true) then
+                    return true
+                end
+            end
+            node = node.Parent
+        end
+        return false
+    end
+
+    local function pressJoinAcceptButton(button)
+        -- Activate reaches modern GUI handlers; firesignal covers older handlers
+        -- wired specifically to MouseButton1Click.
+        pcall(function() button:Activate() end)
+        pcall(function()
+            if firesignal then firesignal(button.MouseButton1Click) end
+        end)
+    end
+
+    local function findAcceptButton(gui)
+        if not gui then return nil end
+        for _, desc in ipairs(gui:GetDescendants()) do
+            if isJoinRequestAcceptButton(desc) then return desc end
+        end
+        return nil
+    end
+
+    local function queueJoinRequest(id, cloneName)
+        local reqId = tostring(id or "")
+        if reqId == "" or hostState.acceptedRequestIds[reqId] then return end
+        local request = hostState.pendingJoinRequests[reqId]
+        if request then
+            request.cloneName = cloneName or request.cloneName
+            return
+        end
+        hostState.pendingJoinRequests[reqId] = {
+            id = id,
+            cloneName = cloneName,
+            firstSeenAt = os.clock(),
+            nextAttemptAt = -math.huge,
+            attempts = 0,
+            logged = false,
+        }
+    end
+
+    local function retryJoinAccept(request)
+        local now = os.clock()
+        if now < request.nextAttemptAt then return end
+        request.nextAttemptAt = now + CONFIG.JOIN_ACCEPT_RETRY_INTERVAL
+        request.attempts = request.attempts + 1
+
+        -- The request panel can arrive after the remote event. When it is visible,
+        -- activate its Accept button too; the remote call remains the fallback.
+        local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+        local gui = pg and pg:FindFirstChild("joinRequestConfirm_" .. tostring(request.id))
+        local button = findAcceptButton(gui)
+        if button then pressJoinAcceptButton(button) end
+
+        if fireRemote("respondJoinRequest", request.id, true) then
+            hostState.lastJoinActivityAt = now
+            hostState.lobbyStartRequested = false
+            hostState.autoStartedDone = false
+            if not request.logged then
+                request.logged = true
+                UI.addLog("Accepting join request: " .. tostring(request.cloneName or request.id), "success")
+            end
+        end
+    end
+
+    local showJoinRequest = getRemote("showJoinRequest", "RemoteEvent")
+    if showJoinRequest then
+        showJoinRequest.OnClientEvent:Connect(function(id, cloneName, act)
+            if not runtimeActive() then return end
+            local reqId = tostring(id or "")
+            if reqId == "" then return end
+            if act == "close" then
+                hostState.pendingJoinRequests[reqId] = nil
+                return
+            end
+            if batchDiscovery.active and cloneName and tostring(cloneName) ~= "" then
+                batchDiscovery.candidates[string.lower(tostring(cloneName))] = tostring(cloneName)
+            end
+            if autoToggle then
+                queueJoinRequest(id, cloneName)
+            end
+        end)
+    end
+
+    task.spawn(function()
+        local lastRequestPanelScanAt = -math.huge
+        while runtimeActive() and task.wait(0.1) do
+            if not autoToggle then continue end
+            local now = os.clock()
+
+            -- Recover requests that were already on screen when this script was
+            -- enabled, or whose event handler ran before the panel was created.
+            if now - lastRequestPanelScanAt >= 0.35 then
+                lastRequestPanelScanAt = now
+                local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+                if pg then
+                    for _, desc in ipairs(pg:GetDescendants()) do
+                        -- This direct UI route handles a request that existed
+                        -- before the auto-carry script was executed, so no remote
+                        -- event/id was available for the retry queue.
+                        if isJoinRequestAcceptButton(desc) then
+                            pressJoinAcceptButton(desc)
+                        end
+                        local reqId = tostring(desc.Name):match("^joinRequestConfirm_(.+)$")
+                        if reqId and desc:IsA("GuiObject") and desc.Visible then
+                            queueJoinRequest(reqId, nil)
+                        end
+                    end
+                end
+            end
+
+            for reqId, request in pairs(hostState.pendingJoinRequests) do
+                local clone = getPlayerByNameInsensitive(request.cloneName)
+                if request.attempts > 0 and clone then
+                    hostState.pendingJoinRequests[reqId] = nil
+                    hostState.acceptedRequestIds[reqId] = true
+                elseif now - request.firstSeenAt >= CONFIG.JOIN_ACCEPT_TIMEOUT then
+                    hostState.pendingJoinRequests[reqId] = nil
+                    UI.addLog("Join request timed out: " .. tostring(request.cloneName or reqId), "warn")
+                else
+                    retryJoinAccept(request)
+                end
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while runtimeActive() and task.wait(0.1) do
+            if not autoToggle then continue end
+            local started = observeMatchState()
+            if not started then
+                hostState.requiredCloneWaitStartedAt = nil
+                if hostState.lobbyCreatedSuccessfully then
+                    local elapsed = os.clock() - hostState.lastJoinActivityAt
+                    local remaining = math.max(0, CONFIG.START_DELAY - elapsed)
+                    local lobbyStage = STAGES[hostState.lobbyStageIndex] or STAGES[currentStage]
+                    local targetStage = STAGES[currentStage]
+                    local detail = hostState.lobbyStageIndex == currentStage
+                        and string.format("Lobby: %s (%s)", lobbyStage.map, lobbyStage.diff)
+                        or string.format("Lobby: %s (%s) | Locked next: %s (%s)", lobbyStage.map, lobbyStage.diff, targetStage.map, targetStage.diff)
+                    -- This is a single immediate preflight, never a wait.
+                    -- If a clone already joined this exact host lobby, set its
+                    -- target before starting; otherwise enter stage 1 at once.
+                    if not next(cloneRoster.entries) then
+                        local lobbyLevel, lobbyName = getLowestHostLobbyCloneLevel()
+                        if lobbyLevel and lobbyName then
+                            local changed = syncStageFromLowestCloneLevel(lobbyLevel, lobbyName)
+                            if changed and hostState.lobbyStageIndex ~= targetState.stageIndex then
+                                abandonMismatchedLobby()
+                                continue
+                            end
+                        end
+                    end
+                    hostState.rosterRequiredWaitStartedAt = nil
+                    UI.setStatus("LOBBY READY", detail, "normal")
+                    UI.setCountdown("Entering now", true)
+                    if not hostState.lobbyStartRequested then
+                        hostState.lobbyStartRequested = startMatch()
+                    end
+                else
+                    UI.setStatus("LOBBY", "Preparing a new room", "normal")
+                    UI.setCountdown("", false)
+                end
+            else
+                if isDungeonBusy() then
+                    hostState.autoStartedDone = true
+                    UI.setCountdown("", false)
+                    if hostState.rosterSnapshotPending then
+                        UI.setStatus("WAITING FOR CLONE IN DUNGEON", "Host entered stage 1; detecting clone party", "warning")
+                        continue
+                    end
+                    local activeStage = STAGES[hostState.activeStageIndex] or STAGES[currentStage]
+                    local targetStage = STAGES[targetState.stageIndex or currentStage]
+                    local detail = hostState.activeStageIndex == (targetState.stageIndex or currentStage)
+                        and string.format("%s (%s) | Target LV.%d", activeStage.map, activeStage.diff, activeStage.targetLvl)
+                        or string.format("Running: %s (%s) | Clone target: %s (%s), LV.%d", activeStage.map, activeStage.diff, targetStage.map, targetStage.diff, targetStage.targetLvl)
+                    UI.setStatus("DUNGEON ACTIVE", detail, "active")
+                elseif not hostState.autoStartedDone then
+                    if hostState.rosterSnapshotPending then
+                        UI.setStatus("SCANNING CLONES", string.format("Levels %d/%d | Characters %d/%d",
+                            hostState.censusLevels, hostState.censusConnected,
+                            hostState.censusCharacters, hostState.censusConnected), "warning")
+                        UI.setCountdown("Resolving dungeon players...", true)
+                        continue
+                    end
+                    local readyCount = getReadyDungeonCloneCounts()
+                    local lowestLevel, lowestName = getLowestConnectedCloneLevel()
+                    local record = lowestLevel and lowestName and { name = lowestName, level = lowestLevel } or nil
+
+                    if record then
+                        local plr = getPlayerByNameInsensitive(record.name)
+                        local char = plr and plr.Character
+                        local isReady = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildOfClass("Humanoid"))
+                            and getPlayerLevel(plr) > 0
+
+                        if isReady then
+                            hostState.requiredCloneWaitStartedAt = nil
+                            local elapsed = os.clock() - hostState.lastJoinActivityAt
+                            local remaining = math.max(0, CONFIG.START_DELAY - elapsed)
+                            UI.setStatus("CLONE READY", string.format("Synchronizing with %s", record.name), "normal")
+                            UI.setCountdown(string.format("Start in %.1fs", remaining), true)
+                            if elapsed >= CONFIG.START_DELAY then
+                                hostState.autoStartedDone = startMatch()
+                            end
+                        else
+                            hostState.requiredCloneWaitStartedAt = hostState.requiredCloneWaitStartedAt or os.clock()
+                            local waitTime = os.clock() - hostState.requiredCloneWaitStartedAt
+                            local remain = math.max(0, CONFIG.REQUIRED_CLONE_TIMEOUT - waitTime)
+                            UI.setStatus("WAITING FOR CLONE", string.format("%s (LV.%s)", record.name, tostring(record.level)), "warning")
+                            UI.setCountdown(string.format("Timeout %ds", math.floor(remain)), true)
+
+                            if waitTime >= CONFIG.REQUIRED_CLONE_TIMEOUT then
+                                UI.addLog(string.format("Clone %s timed out and was removed from memory", record.name), "warn")
+                                cloneMemoryState.remembered[string.lower(record.name)] = nil
+                                cloneMemoryState.save()
+                                hostState.requiredCloneWaitStartedAt = nil
+                            end
+                        end
+                    elseif readyCount > 0 then
+                        local elapsed = os.clock() - hostState.lastJoinActivityAt
+                        local remaining = math.max(0, CONFIG.START_DELAY - elapsed)
+                        UI.setStatus("CLONES READY", string.format("%d clones in dungeon", readyCount), "normal")
+                        UI.setCountdown(string.format("Start in %.1fs", remaining), true)
+                        if elapsed >= CONFIG.START_DELAY then
+                            hostState.autoStartedDone = startMatch()
+                        end
+                    else
+                        UI.setStatus("SCANNING CLONES", "Waiting for player and level replication", "warning")
+                        UI.setCountdown("Detecting dungeon party...", true)
+                    end
+                end
+            end
+        end
+    end)
+
+    task.spawn(function()
+        local lastState = isMatchStarted()
+        local activeStageIndex = currentStage
+        local bossDetectedAt = nil
+
+        while runtimeActive() and task.wait(1) do
+            if not autoToggle then continue end
+            local started = observeMatchState()
+
+            if started and not lastState then
+                hostState.isReplaying = false
+                hostState.pendingJoinRequests = {}
+                hostState.rosterFinishRecorded = false
+                hostState.webhookSentForMatch = false
+                activeStageIndex = hostState.lobbyStageIndex or currentStage
+                hostState.activeStageIndex = activeStageIndex
+                targetState.activeStageIndex = activeStageIndex
+                bossDetectedAt = nil
+                hostState.rosterSnapshotPending = true
+                hostState.rosterRefreshUntil = os.clock() + 15
+                local snapshotLowest, hasSnapshot, censusComplete, connected, resolved, initialized = snapshotHostDungeonRoster()
+                hostState.censusConnected = connected or 0
+                hostState.censusLevels = resolved or 0
+                hostState.censusCharacters = initialized or 0
+                batchDiscovery.bootstrapAwaitingDungeon = false
+                if hasSnapshot and snapshotLowest then
+                    hostState.rosterSnapshotPending = not censusComplete
+                    syncStageFromLowestCloneLevel(snapshotLowest.level, snapshotLowest.name)
+                    UI.addLog(string.format("Host roster captured: %s LV.%d is the target", snapshotLowest.name, snapshotLowest.level), "success")
+                else
+                    UI.addLog("Dungeon started without a clone roster snapshot", "warn")
+                end
+                UI.addLog(string.format("Dungeon started: %s (%s) | Target LV.%d",
+                    STAGES[activeStageIndex].map, STAGES[activeStageIndex].diff, STAGES[activeStageIndex].targetLvl), "info")
+            elseif not started and lastState then
+                hostState.acceptedRequestIds = {}
+                hostState.lobbyCreatedSuccessfully = false
+                hostState.lobbyStageIndex = nil
+                hostState.autoStartedDone = false
+                targetState.activeStageIndex = nil
+                applyTargetToLobby()
+                -- Returning from a dungeon can leave the old room allocated on
+                -- the server. Close it once before attempting createLobby for a
+                -- different clone-derived stage.
+                hostState.needsLobbyRebuild = targetState.ready and targetState.stageIndex ~= activeStageIndex
+                if hostState.needsLobbyRebuild then
+                    hostState.lastLobbyCreateAt = os.clock()
+                end
+                bossDetectedAt = nil
+                UI.addLog("Returned to lobby; preparing a new room", "info")
+            end
+            lastState = started
+
+            if started then
+                local busyNow = isDungeonBusy()
+                local minCloneLvl, minCloneName, cloneCount = getLowestConnectedCloneLevel()
+                minCloneLvl = minCloneLvl or 999
+
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr ~= localPlayer then
+                        local lvl = getPlayerLevel(plr)
+                        local rName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+                        if lvl > 0 then
+                            cloneMemoryState.remembered[string.lower(rName)] = { name = rName, level = lvl }
+                        end
+                    end
+                end
+
+                -- A new batch can start before any clone reaches the lobby.
+                -- As soon as clone members are visible inside the dungeon,
+                -- take the host-side party snapshot and let it drive the
+                -- following map selection.
+                if hostState.rosterSnapshotPending and cloneCount > 0 and minCloneLvl ~= 999 then
+                    local joinedLowest, joinedSnapshot, censusComplete, connected, resolved, initialized = snapshotHostDungeonRoster()
+                    hostState.censusConnected = connected or 0
+                    hostState.censusLevels = resolved or 0
+                    hostState.censusCharacters = initialized or 0
+                    if joinedSnapshot and joinedLowest then
+                        hostState.rosterSnapshotPending = not censusComplete
+                        batchDiscovery.active = false
+                        batchDiscovery.bootstrapAwaitingDungeon = false
+                        batchDiscovery.startWithoutLobbyClones = false
+                        syncStageFromLowestCloneLevel(joinedLowest.level, joinedLowest.name)
+                        UI.addLog(string.format("Clone roster captured inside dungeon: %s LV.%d", joinedLowest.name, joinedLowest.level), "success")
+                    end
+                end
+
+                local activeStageData = STAGES[activeStageIndex] or STAGES[currentStage]
+                local completionTarget = activeStageData.targetLvl
+                if busyNow then cloneMemoryState.save() end
+
+                -- The next stage is derived from one stable authoritative
+                -- source: the lowest roster clone (with its live Level when
+                -- available). `activeStageIndex` stays unchanged, so the map
+                -- currently being played is never switched mid-dungeon.
+                local nextTargetLevel, nextTargetName = getAuthoritativeCloneTarget()
+                if nextTargetLevel then
+                    syncStageFromLowestCloneLevel(nextTargetLevel, nextTargetName)
+                    UI.setStage(currentStage, nextTargetLevel)
+                end
+
+                if getDungeonProgress() == "bosskilled" then
+                    bossDetectedAt = bossDetectedAt or os.clock()
+                else
+                    bossDetectedAt = nil
+                    if getDungeonProgress() == "in process" then
+                        hostState.rosterFinishRecorded = false
+                        -- Replay can start another round without flipping the
+                        -- broader in-dungeon state, so arm one report per run.
+                        hostState.webhookSentForMatch = false
+                    end
+                end
+
+                if isDungeonFinished() then
+                    local levelPending = cloneCount > 0 and minCloneLvl == 999
+                    if levelPending and os.clock() - (bossDetectedAt or os.clock()) < CONFIG.LEVEL_RESOLVE_GRACE then
+                        matchCycle.finishConsumed = false
+                        UI.setStatus("SYNCING CLONE LEVELS", "Waiting for replicated level data", "warning")
+                    elseif cloneCount > 0 and minCloneLvl ~= 999 and targetState.ready and targetState.stageIndex ~= activeStageIndex then
+                        recordRosterCompletion()
+                        sendCompletionWebhookOnce()
+                        local resolvedLevel, resolvedName = getAuthoritativeCloneTarget()
+                        if resolvedLevel then syncStageFromLowestCloneLevel(resolvedLevel, resolvedName) end
+                        local nextStage = STAGES[targetState.stageIndex]
+                        UI.addLog(string.format("Boss defeated; roster target %s LV.%d locked next map to %s (%s)", targetState.cloneName or "clone", targetState.cloneLevel or 0, nextStage.map, nextStage.diff), "success")
+                        cloneMemoryState.save()
+                        leaveGame("Lowest clone target changed")
+                    elseif cloneCount > 0 and minCloneLvl ~= 999 and minCloneLvl >= completionTarget then
+                        recordRosterCompletion()
+                        sendCompletionWebhookOnce()
+                        UI.addLog(string.format("Boss defeated; clone level %d reached target %d", minCloneLvl, completionTarget), "success")
+                        local resolvedLevel, resolvedName = getAuthoritativeCloneTarget()
+                        if resolvedLevel then syncStageFromLowestCloneLevel(resolvedLevel, resolvedName) end
+                        cloneMemoryState.save()
+                        leaveGame("Stage target reached")
+                    elseif not hostState.isReplaying then
+                        recordRosterCompletion()
+                        sendCompletionWebhookOnce()
+                        hostState.isReplaying = true
+                        local reportedLevel = minCloneLvl == 999 and 0 or minCloneLvl
+                        UI.addLog(string.format("Level below target (%d/%d); replaying", reportedLevel, completionTarget), "info")
+                        local ok = fireRemote("replayDungeon", {{
+                            dungeonProgress = "bossKilled", dungeonStarted = true, dungeonFinished = true,
+                            hardcore = HARDCORE_ENABLED, dungeonName = activeStageData.map, isHardcore = HARDCORE_ENABLED, fightingBoss = true
+                        }})
+                        if not ok then
+                            matchCycle.finishConsumed = false
+                            UI.addLog("Replay request failed; retrying", "warn")
+                        end
+                        task.wait(CONFIG.REPLAY_COOLDOWN)
+                        hostState.isReplaying = false
+                    end
+                end
+            else
+                if isInLobby() and not hostState.lobbyCreatedSuccessfully then
+                    if hostState.needsLobbyRebuild then
+                        hostState.needsLobbyRebuild = false
+                        hostState.lastLobbyCreateAt = os.clock()
+                        local closed = fireRemote("leaveGame")
+                        if not closed then fireRemote("ReturnToLobbyEvent") end
+                        UI.addLog("Closing completed room before creating clone target", "info")
+                    elseif not targetState.ready then
+                        -- No roster is never a reason to stall the lobby.
+                        -- Bootstrap a LV.1 room and let clone handling happen
+                        -- only after the host has entered the dungeon.
+                        currentStage = 1
+                        targetState.ready = true
+                        targetState.stageIndex = 1
+                        targetState.cloneLevel = 0
+                        targetState.cloneName = "Dungeon discovery"
+                        targetState.lastLiveAt = os.clock()
+                        saveStage()
+                        UI.setStage(1, 0)
+                        UI.addLog("No roster target; bootstrapping Desert Temple Easy", "info")
+                    elseif os.clock() - hostState.lastLobbyCreateAt >= CONFIG.LOBBY_RETRY_DELAY then
+                        local s = STAGES[targetState.stageIndex]
+                        hostState.lastLobbyCreateAt = os.clock()
+                        local ok = createStageLobby(s.map, s.diff)
+                        if ok then
+                            hostState.lobbyCreatedSuccessfully = true
+                            hostState.lobbyStageIndex = targetState.stageIndex
+                            hostState.lobbyStartRequested = false
+                            hostState.lastJoinActivityAt = os.clock()
+                            UI.addLog("Lobby created from clone target: " .. s.map .. " (" .. s.diff .. ")", "success")
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Wake on the stable signals that actually exist in live dungeon sessions:
+    -- player membership, character replication, and optional leaderstats.
+    local hookedPlayers = setmetatable({}, { __mode = "k" })
+    local hookedLeaderstats = setmetatable({}, { __mode = "k" })
+    local function wakeDungeonRosterResolver()
+        if runtimeActive() and isInDungeon() then
+            hostState.rosterSnapshotPending = true
+            hostState.rosterRefreshUntil = os.clock() + 30
+        end
+    end
+    local function hookLeaderstats(leaderstats)
+        if not leaderstats or hookedLeaderstats[leaderstats] then return end
+        hookedLeaderstats[leaderstats] = true
+        local function hookLevel(levelObject)
+            if not levelObject or levelObject.Name ~= "Level" then return end
+            wakeDungeonRosterResolver()
+            levelObject:GetPropertyChangedSignal("Value"):Connect(wakeDungeonRosterResolver)
+        end
+        hookLevel(leaderstats:FindFirstChild("Level"))
+        leaderstats.ChildAdded:Connect(hookLevel)
+    end
+    local function hookDungeonParticipant(plr)
+        if not runtimeActive() or plr == localPlayer or hookedPlayers[plr] then return end
+        hookedPlayers[plr] = true
+        wakeDungeonRosterResolver()
+        hookLeaderstats(plr:FindFirstChild("leaderstats"))
+        plr.ChildAdded:Connect(function(child)
+            if child.Name == "leaderstats" then hookLeaderstats(child) end
+            if child.Name == "leaderstats" then wakeDungeonRosterResolver() end
+        end)
+        plr.CharacterAdded:Connect(wakeDungeonRosterResolver)
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do hookDungeonParticipant(plr) end
+    Players.PlayerAdded:Connect(hookDungeonParticipant)
+    Players.PlayerRemoving:Connect(function(plr)
+        if plr ~= localPlayer then wakeDungeonRosterResolver() end
+    end)
+end
+
+function cloneMemoryState.runClone()
+    local hostMissingSince = nil
+    local lastJoinAttempt = -math.huge
+    local isBuyingGamepass = false
+    local isLeavingForGamepass = false
+    local lastPriceFetch = -math.huge
+    local lastPriceLevel = -1
+    local passCache = {}
+    local purchaseRetryAt = {}
+    local purchaseFailures = {}
+
+    local GAMEPASS_PRIORITY = {
+        { id = "vip",               label = "VIP" },
+        { id = "goldGamepass",      label = "X2 Gold" },
+        { id = "extraItemGamepass", label = "+1 Item" },
+        { id = "freeStatResets",    label = "Free Stat Resets" }
+    }
+
+    local function isPassOwned(id)
+        local obj = localPlayer:FindFirstChild(id)
+        if obj and obj:IsA("ValueBase") and obj.Value == true then
+            return true
+        end
+        if passCache[id] and passCache[id].owned == true then
+            return true
+        end
+        return false
+    end
+
+    local function updatePassPrices(force)
+        local currentLevel = getLocalLevel()
+        if currentLevel > 0 and currentLevel ~= lastPriceLevel then force = true end
+        if not force and os.clock() - lastPriceFetch < 15 then return end
+        lastPriceFetch = os.clock()
+        if currentLevel > 0 then lastPriceLevel = currentLevel end
+
+        for _, item in ipairs(GAMEPASS_PRIORITY) do
+            if not runtimeActive() then return end
+            local id = item.id
+            if isPassOwned(id) then
+                local knownCost = passCache[id] and passCache[id].cost or latestGamepassPrices[id] and latestGamepassPrices[id].cost
+                passCache[id] = { cost = knownCost, owned = true, ready = true }
+                latestGamepassPrices[id] = { cost = knownCost, owned = true, ready = true }
+            elseif not passCache[id] or not passCache[id].cost or force then
+                local ok, info = invokeRemote("getGoldGamepassPrice", id)
+                if ok and type(info) == "table" then
+                    passCache[id] = {
+                        cost = tonumber(info.cost),
+                        owned = (info.owned == true) or isPassOwned(id),
+                        ready = info.ready ~= false,
+                    }
+                    latestGamepassPrices[id] = {
+                        cost = passCache[id].cost,
+                        owned = passCache[id].owned,
+                        ready = passCache[id].ready,
+                    }
+                end
+            end
+        end
+    end
+    refreshGamepassPricesForHistory = function()
+        updatePassPrices(true)
+        return latestGamepassPrices
+    end
+
+    local function getNextPriorityTarget()
+        for _, item in ipairs(GAMEPASS_PRIORITY) do
+            if not isPassOwned(item.id) then
+                local data = passCache[item.id]
+                return item, data and data.ready and data.cost or nil
+            end
+        end
+        return nil, nil
+    end
+
+    local goldPurchaseResult = getRemote("goldGamepassPurchaseResult", "RemoteEvent")
+    if goldPurchaseResult then
+        goldPurchaseResult.OnClientEvent:Connect(function(res)
+            if not runtimeActive() then return end
+            if type(res) == "table" and res.success and res.gamepassKey then
+                if passCache[res.gamepassKey] then
+                    passCache[res.gamepassKey].owned = true
+                    latestGamepassPrices[res.gamepassKey] = {
+                        cost = passCache[res.gamepassKey].cost or 0,
+                        owned = true,
+                        ready = true,
+                    }
+                end
+                purchaseFailures[res.gamepassKey] = 0
+                purchaseRetryAt[res.gamepassKey] = os.clock() + 5
+            end
+        end)
+    end
+
+    task.spawn(function()
+        while runtimeActive() and task.wait(0.8) do
+            if not autoToggle then continue end
+
+            updatePassPrices(false)
+            local currentGold = getLocalGold()
+            local targetPass, cost = getNextPriorityTarget()
+
+            for _, pItem in ipairs(GAMEPASS_PRIORITY) do
+                local owned = isPassOwned(pItem.id)
+                local isTarget = targetPass and (targetPass.id == pItem.id)
+                local pCost = passCache[pItem.id] and passCache[pItem.id].cost or (isTarget and cost or 0)
+                UI.updateGamepass(pItem.id, owned, currentGold, pCost, isTarget, isBuyingGamepass and isTarget)
+            end
+
+            local myLvl = getLocalLevel()
+            if myLvl > 0 then
+                UI.setStage(currentStage, myLvl)
+            end
+
+            if isInLobby() then
+                isLeavingForGamepass = false
+
+                if targetPass and cost and cost > 0 and currentGold >= cost and os.clock() >= (purchaseRetryAt[targetPass.id] or -math.huge) then
+                    isBuyingGamepass = true
+                    UI.setStatus("PURCHASING GAMEPASS", string.format("%s for %d Gold", targetPass.label, cost), "warning")
+                    UI.addLog(string.format("Purchasing %s | Cost %d | Gold %d", targetPass.label, cost, currentGold), "info")
+
+                    local bought = fireRemote("requestGoldGamepassPurchase", targetPass.id)
+                    local confirmed = false
+                    if bought then
+                        local beforeGold = currentGold
+                        local waitStart = os.clock()
+                        repeat
+                            task.wait(0.3)
+                            currentGold = getLocalGold()
+                        until currentGold < beforeGold or isPassOwned(targetPass.id) or (os.clock() - waitStart >= 6) or not isInLobby() or not runtimeActive()
+
+                        confirmed = currentGold < beforeGold or isPassOwned(targetPass.id)
+                        if confirmed then
+                            if passCache[targetPass.id] then
+                                passCache[targetPass.id].owned = true
+                            end
+                            UI.addLog(string.format("Purchased %s; %d Gold remaining", targetPass.label, currentGold), "success")
+                        else
+                            UI.addLog("Server did not confirm purchase: " .. targetPass.label, "warn")
+                        end
+                    end
+                    if confirmed then
+                        purchaseFailures[targetPass.id] = 0
+                        purchaseRetryAt[targetPass.id] = os.clock() + 5
+                    else
+                        local failures = (purchaseFailures[targetPass.id] or 0) + 1
+                        purchaseFailures[targetPass.id] = failures
+                        purchaseRetryAt[targetPass.id] = os.clock() + math.min(60, 5 * (2 ^ (failures - 1)))
+                    end
+                    isBuyingGamepass = false
+                    task.wait(CONFIG.GOLD_PURCHASE_DELAY or 1.5)
+                else
+                    isBuyingGamepass = false
+                end
+            else
+                if targetPass and cost and currentGold >= cost then
+                    if not isLeavingForGamepass then
+                        isLeavingForGamepass = true
+                        isBuyingGamepass = true
+                        UI.setStatus("GAMEPASS AFFORDABLE", string.format("%d/%d Gold; returning for %s", currentGold, cost, targetPass.label), "warning")
+                        UI.addLog(string.format("Returning to buy %s (%d/%d Gold)", targetPass.label, currentGold, cost), "info")
+                        task.spawn(function()
+                            leaveGame("Purchasing " .. targetPass.label)
+                            task.wait(10)
+                            isLeavingForGamepass = false
+                        end)
+                    end
+                end
+            end
+        end
+    end)
+
+    local ls = localPlayer:FindFirstChild("leaderstats")
+    local lvlObj = ls and ls:FindFirstChild("Level")
+    if lvlObj then
+        lvlObj:GetPropertyChangedSignal("Value"):Connect(function()
+            if not runtimeActive() then return end
+            updatePassPrices(true)
+        end)
+    end
+
+    task.spawn(function()
+        while runtimeActive() and task.wait(0.25) do
+            if not autoToggle then continue end
+
+            if isMatchStarted() then
+                local hostPlr = getPlayerByNameInsensitive(HOST_NAME)
+                if not hostPlr then
+                    hostMissingSince = hostMissingSince or os.clock()
+                    local missingFor = os.clock() - hostMissingSince
+                    UI.setStatus("HOST CONNECTION LOST", string.format("Host missing for %.1f/%.1fs", missingFor, CONFIG.LOST_HOST_TIMEOUT), "danger")
+                    UI.setCountdown(string.format("Exit in %.1fs", math.max(0, CONFIG.LOST_HOST_TIMEOUT - missingFor)), true)
+
+                    if missingFor >= CONFIG.LOST_HOST_TIMEOUT then
+                        UI.addLog("Host left; clone is returning", "warn")
+                        leaveGame("Host left")
+                        break
+                    end
+                else
+                    hostMissingSince = nil
+                    UI.setStatus("FOLLOWING HOST", string.format("Connected to %s", HOST_NAME), "active")
+                    UI.setCountdown("", false)
+                end
+            else
+                hostMissingSince = nil
+                if isBuyingGamepass then
+                    UI.setStatus("PURCHASING GAMEPASS", "Join requests paused", "warning")
+                    UI.setCountdown("", false)
+                else
+                    local elapsed = os.clock() - lastJoinAttempt
+                    local remaining = math.max(0, CONFIG.JOIN_REQUEST_INTERVAL - elapsed)
+                    UI.setStatus("CONNECTING TO HOST", string.format("Target: %s", HOST_NAME), "normal")
+                    UI.setCountdown(string.format("Request in %.1fs", remaining), true)
+
+                    if elapsed >= CONFIG.JOIN_REQUEST_INTERVAL then
+                        lastJoinAttempt = os.clock()
+                        invokeRemote("sendJoinRequest", HOST_NAME)
+                    end
+                end
+            end
+        end
+    end)
+
+    Players.PlayerRemoving:Connect(function(plr)
+        if not runtimeActive() then return end
+        local rName = (playerRealNames and playerRealNames[plr]) or tostring(plr.Name)
+        if autoToggle and isMatchStarted() and string.lower(rName) == string.lower(HOST_NAME) then
+            UI.addLog("Host disconnect detected", "warn")
+            leaveGame("Host disconnected")
+        end
+    end)
+end
+
+task.spawn(function()
+    local ok, err = pcall(function()
+        if isHost then
+            cloneMemoryState.runHost()
+        else
+            cloneMemoryState.runClone()
+        end
+    end)
+    if not ok then
+        reportRemoteProblem("runtime", tostring(err))
+        if UI then UI.addLog("Runtime initialization failed: " .. tostring(err), "danger") end
+    end
+end)
+
+pcall(function()
+    UI.addLog("Auto Carry Pro initialized", "success")
+    if not isHost then
+        UI.addLog("Clone automation ready", "info")
+    end
+end)
+print("[AutoCarry Pro] Initialized")
