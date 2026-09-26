@@ -1,0 +1,815 @@
+--!nocheck
+if not game:IsLoaded() then
+    pcall(function() game.Loaded:Wait() end)
+end
+
+local sharedRuntime = (getgenv and getgenv()) or _G
+local runtimeToken = {}
+sharedRuntime.__AutoCarryRuntimeToken = runtimeToken
+local externalConfig = type(sharedRuntime.AutoCarryConfig) == "table" and sharedRuntime.AutoCarryConfig or {}
+
+-- Read the getgenv configuration once, before this script starts its runtime.
+-- Both camelCase and PascalCase keys are supported for convenience.
+local function configValue(...)
+    for index = 1, select("#", ...) do
+        local key = select(index, ...)
+        local value = externalConfig[key]
+        if value ~= nil then return value end
+    end
+    return nil
+end
+
+local function configBoolean(defaultValue, ...)
+    local value = configValue(...)
+    if type(value) == "boolean" then return value end
+    if type(value) == "number" then return value ~= 0 end
+    if type(value) == "string" then
+        local normalized = string.lower(value:match("^%s*(.-)%s*$"))
+        if normalized == "true" or normalized == "on" or normalized == "yes" or normalized == "1" then return true end
+        if normalized == "false" or normalized == "off" or normalized == "no" or normalized == "0" then return false end
+    end
+    return defaultValue
+end
+
+local function runtimeActive()
+    return sharedRuntime.__AutoCarryRuntimeToken == runtimeToken
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local localPlayer = Players.LocalPlayer
+while runtimeActive() and not localPlayer do
+    localPlayer = Players.LocalPlayer
+    task.wait(0.1)
+end
+if not runtimeActive() or not localPlayer then return end
+
+local SPOOFED_NAME = "BRUH HUB"
+local realPlayerName = tostring(localPlayer.Name)
+local playerRealNames = {}
+local allRealNamesSet = {}
+
+local function registerPlayerNames(plr)
+    if not runtimeActive() then return end
+    if not plr or not plr:IsA("Player") then return end
+    pcall(function()
+        local n = tostring(plr.Name)
+        local dn = tostring(plr.DisplayName)
+        playerRealNames[plr] = n
+        if n and #n >= 2 then allRealNamesSet[n] = true end
+        if dn and #dn >= 2 then allRealNamesSet[dn] = true end
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    registerPlayerNames(p)
+end
+Players.PlayerAdded:Connect(registerPlayerNames)
+
+local FAKE_TITLE = {
+    enabled = true,
+    text = "THE UNDEFEATED",
+}
+
+local function applyFakeTitleToCharacter(char)
+    if not runtimeActive() or not char or not FAKE_TITLE.enabled then return end
+    task.spawn(function()
+        local head = char:FindFirstChild("Head") or char:WaitForChild("Head", 4)
+        if not runtimeActive() or not head then return end
+        task.wait(0.2)
+        if not runtimeActive() then return end
+        local bb = head:FindFirstChildOfClass("BillboardGui") or char:FindFirstChildOfClass("BillboardGui")
+        if not bb then
+            for _, desc in ipairs(char:GetDescendants()) do
+                if desc:IsA("BillboardGui") then bb = desc; break end
+            end
+        end
+        if bb then
+            local titleLbl = bb:FindFirstChild("title") or bb:FindFirstChild("Title") or bb:FindFirstChild("rank")
+            if not titleLbl then
+                for _, desc in ipairs(bb:GetDescendants()) do
+                    if desc:IsA("TextLabel") and (string.find(string.lower(desc.Name), "title") or string.find(string.lower(desc.Name), "rank")) then
+                        titleLbl = desc
+                        break
+                    end
+                end
+            end
+            if titleLbl then
+                titleLbl.Text = FAKE_TITLE.text
+                titleLbl.TextColor3 = Color3.fromRGB(255, 215, 0)
+                titleLbl.Visible = true
+            else
+                local customTitle = bb:FindFirstChild("AutoCarryFakeTitle")
+                if not customTitle then
+                    customTitle = Instance.new("TextLabel", bb)
+                    customTitle.Name = "AutoCarryFakeTitle"
+                    customTitle.Size = UDim2.new(1, 0, 0, 16)
+                    customTitle.Position = UDim2.new(0, 0, 0, -18)
+                    customTitle.BackgroundTransparency = 1
+                    customTitle.Font = Enum.Font.GothamBold
+                    customTitle.TextSize = 11
+                    customTitle.TextColor3 = Color3.fromRGB(255, 215, 0)
+                    customTitle.TextStrokeTransparency = 0.2
+                    customTitle.TextStrokeColor3 = Color3.fromRGB(40, 20, 0)
+                end
+                customTitle.Text = FAKE_TITLE.text
+                customTitle.Visible = true
+            end
+        end
+    end)
+end
+
+if localPlayer.Character then
+    applyFakeTitleToCharacter(localPlayer.Character)
+end
+localPlayer.CharacterAdded:Connect(function(newChar)
+    if not runtimeActive() then return end
+    applyFakeTitleToCharacter(newChar)
+end)
+
+local spoofUpdateGuard = setmetatable({}, { __mode = "k" })
+local spoofObserved = setmetatable({}, { __mode = "k" })
+local function replacePlain(text, needle, replacement)
+    local pattern = tostring(needle):gsub("(%W)", "%%%1")
+    return tostring(text):gsub(pattern, function() return replacement end)
+end
+
+local function applyNameSpoof(inst)
+    if not runtimeActive() then return end
+    if not (inst:IsA("TextLabel") or inst:IsA("TextButton")) then return end
+
+    local function updateText()
+        if not runtimeActive() then return end
+        if spoofUpdateGuard[inst] then return end
+        local cur = inst.Text
+        if not cur or cur == "" then return end
+        local newText = cur
+        for rName, _ in pairs(allRealNamesSet) do
+            if #rName >= 2 and string.find(newText, rName, 1, true) then
+                newText = replacePlain(newText, rName, SPOOFED_NAME)
+            end
+        end
+        if newText ~= cur then
+            spoofUpdateGuard[inst] = true
+            inst.Text = newText
+            spoofUpdateGuard[inst] = nil
+        end
+    end
+
+    updateText()
+    if spoofObserved[inst] then return end
+    spoofObserved[inst] = true
+    inst:GetPropertyChangedSignal("Text"):Connect(updateText)
+end
+
+local function updateSpoofedName(newName)
+    newName = tostring(newName or ""):match("^%s*(.-)%s*$")
+    if newName == "" or newName == SPOOFED_NAME then return false end
+    local previous = SPOOFED_NAME
+    SPOOFED_NAME = newName
+    local roots = { localPlayer:FindFirstChildOfClass("PlayerGui"), workspace }
+    pcall(function() table.insert(roots, game:GetService("CoreGui")) end)
+    for _, root in ipairs(roots) do
+        if root then
+            for _, inst in ipairs(root:GetDescendants()) do
+                if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and string.find(inst.Text, previous, 1, true) then
+                    spoofUpdateGuard[inst] = true
+                    inst.Text = replacePlain(inst.Text, previous, newName)
+                    spoofUpdateGuard[inst] = nil
+                end
+            end
+        end
+    end
+    return true
+end
+
+task.spawn(function()
+    if not runtimeActive() then return end
+    local pg = localPlayer:FindFirstChildOfClass("PlayerGui") or localPlayer:WaitForChild("PlayerGui", 5)
+    if not runtimeActive() then return end
+    if pg then
+        for _, desc in ipairs(pg:GetDescendants()) do applyNameSpoof(desc) end
+        pg.DescendantAdded:Connect(applyNameSpoof)
+    end
+
+    pcall(function()
+        local cg = game:GetService("CoreGui")
+        if cg then
+            for _, desc in ipairs(cg:GetDescendants()) do applyNameSpoof(desc) end
+            cg.DescendantAdded:Connect(applyNameSpoof)
+        end
+    end)
+
+    local function hookCharacter(char)
+        if not runtimeActive() or not char then return end
+        for _, desc in ipairs(char:GetDescendants()) do applyNameSpoof(desc) end
+        char.DescendantAdded:Connect(applyNameSpoof)
+    end
+
+    local function hookPlayerChar(plr)
+        if not runtimeActive() then return end
+        if plr.Character then hookCharacter(plr.Character) end
+        plr.CharacterAdded:Connect(function(newChar)
+            task.wait(0.3)
+            if not runtimeActive() then return end
+            hookCharacter(newChar)
+        end)
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        hookPlayerChar(plr)
+    end
+    Players.PlayerAdded:Connect(hookPlayerChar)
+
+    workspace.DescendantAdded:Connect(function(desc)
+        if not runtimeActive() then return end
+        if desc:IsA("BillboardGui") or desc:IsA("SurfaceGui") then
+            for _, child in ipairs(desc:GetDescendants()) do applyNameSpoof(child) end
+            desc.DescendantAdded:Connect(applyNameSpoof)
+        end
+    end)
+end)
+
+local remotes = ReplicatedStorage:FindFirstChild("remotes")
+task.spawn(function()
+    if not remotes then
+        remotes = ReplicatedStorage:WaitForChild("remotes", 10)
+    end
+end)
+local lobbyPlaceId = 77649408247578
+-- Exact PlaceManager mappings from the supplied game source.
+local LOBBY_PLACE_IDS = {
+    [77649408247578] = true, [136086934607281] = true,
+    [13691484057] = true, [14470364385] = true, [94441183844172] = true,
+}
+local DUNGEON_PLACE_IDS = {
+    [85776757589518] = true, [115445507767090] = true,
+    [122144693520240] = true, [13819238978] = true,
+    [14052121570] = true, [14052125574] = true,
+    [14470497982] = true, [14470511715] = true,
+    [108777488403937] = true, [133825491040483] = true,
+}
+
+local DEFAULT_HOST_NAME = "RyanWong83653"
+local HOST_NAME_FILE = "AutoCarry_HostName.txt"
+local HOST_NAME = DEFAULT_HOST_NAME
+pcall(function()
+    if isfile and isfile(HOST_NAME_FILE) and readfile then
+        local savedName = tostring(readfile(HOST_NAME_FILE)):match("^%s*(.-)%s*$")
+        if savedName and savedName ~= "" then
+            HOST_NAME = savedName
+        end
+    end
+end)
+local configuredHostName = tostring(configValue("hostName", "HostName") or ""):match("^%s*(.-)%s*$")
+if #configuredHostName >= 3 and #configuredHostName <= 20 and configuredHostName:match("^[%w_]+$") then
+    HOST_NAME = configuredHostName
+end
+
+-- Defaults preserve the original behavior: Hardcore and Anti-AFK are enabled.
+local HARDCORE_ENABLED = configBoolean(true, "hardcore", "Hardcore")
+
+local ANTI_AFK_ENABLED = configBoolean(true, "antiAfk", "AntiAfk")
+
+-- Host-only Discord report. Keep the URL in getgenv().AutoCarryConfig rather
+-- than the script file so it is not accidentally shared with the script.
+local DISCORD_WEBHOOK_URL = tostring(configValue("webhookUrl", "WebhookUrl", "discordWebhook", "DiscordWebhook") or ""):match("^%s*(.-)%s*$")
+local DISCORD_WEBHOOK_ENABLED = configBoolean(DISCORD_WEBHOOK_URL ~= "", "webhookEnabled", "WebhookEnabled", "discordWebhookEnabled", "DiscordWebhookEnabled")
+
+local CONFIG = {
+    START_DELAY = 7,
+    REQUIRED_CLONE_TIMEOUT = 300,
+    LEVEL_RESOLVE_GRACE = 15,
+    JOIN_REQUEST_INTERVAL = 3,
+    JOIN_ACCEPT_RETRY_INTERVAL = 0.25,
+    JOIN_ACCEPT_TIMEOUT = 15,
+    LOST_HOST_TIMEOUT = 3,
+    REPLAY_COOLDOWN = 6,
+    LOBBY_RETRY_DELAY = 5,
+    START_COOLDOWN = 2,
+    GOLD_PURCHASE_DELAY = 1.5,
+    AUTO_SELL_INTERVAL = 12,
+    AUTO_SELL_INITIAL_DELAY = 6,
+    AUTO_EQUIP_INTERVAL = 15,
+    AUTO_EQUIP_INITIAL_DELAY = 3,
+    EQUIP_REMOTE_DELAY = 0.18,
+    AUTO_EQUIP_BUILD = "mage",
+    AUTO_SKILL_INTERVAL = 0.35,
+    AUTO_SKILL_RETRY_DELAY = 1,
+    MANUAL_COMBAT_GRACE = 2,
+    -- Preserve the last verified clone target while the party transitions
+    -- from a dungeon back to the lobby and leaderstats re-replicate.
+    CLONE_TARGET_GRACE = 15,
+    TARGET_SYNC_INTERVAL = 0.15,
+    ROSTER_REQUIRED_CLONE_TIMEOUT = 120,
+    ROSTER_MAX_MISSED_MATCHES = 3,
+}
+
+local nextAutoEquipAllowedAt = -math.huge
+local LOADOUT_SETTINGS_FILE = "AutoCarry_Loadout.txt"
+pcall(function()
+    if isfile and readfile and isfile(LOADOUT_SETTINGS_FILE) then
+        local savedBuild = string.lower(tostring(readfile(LOADOUT_SETTINGS_FILE)):match("^%s*(.-)%s*$"))
+        if savedBuild == "warrior" or savedBuild == "mage" then CONFIG.AUTO_EQUIP_BUILD = savedBuild end
+    end
+end)
+local configuredLoadout = string.lower(tostring(configValue("loadout", "Loadout") or "")):match("^%s*(.-)%s*$")
+if configuredLoadout == "warrior" or configuredLoadout == "mage" then
+    CONFIG.AUTO_EQUIP_BUILD = configuredLoadout
+end
+
+local function setAutoEquipBuild(build)
+    build = string.lower(tostring(build or ""))
+    if build ~= "warrior" and build ~= "mage" then return false end
+    CONFIG.AUTO_EQUIP_BUILD = build
+    nextAutoEquipAllowedAt = -math.huge
+    pcall(function() if writefile then writefile(LOADOUT_SETTINGS_FILE, build) end end)
+    return true
+end
+
+local STAGES = {
+    { map = "Desert Temple", diff = "Easy",      minLvl = 1,   targetLvl = 6   },
+    { map = "Desert Temple", diff = "Medium",    minLvl = 6,   targetLvl = 12  },
+    { map = "Desert Temple", diff = "Hard",      minLvl = 12,  targetLvl = 20  },
+    { map = "Desert Temple", diff = "Insane",    minLvl = 20,  targetLvl = 27  },
+    { map = "Desert Temple", diff = "Nightmare", minLvl = 27,  targetLvl = 33  },
+
+    { map = "Winter Outpost", diff = "Easy",      minLvl = 33,  targetLvl = 40  },
+    { map = "Winter Outpost", diff = "Medium",    minLvl = 40,  targetLvl = 45  },
+    { map = "Winter Outpost", diff = "Hard",      minLvl = 45,  targetLvl = 50  },
+    { map = "Winter Outpost", diff = "Insane",    minLvl = 50,  targetLvl = 55  },
+    { map = "Winter Outpost", diff = "Nightmare", minLvl = 55,  targetLvl = 60  },
+
+    { map = "Pirate Island", diff = "Insane",    minLvl = 60,  targetLvl = 65  },
+    { map = "Pirate Island", diff = "Nightmare", minLvl = 65,  targetLvl = 70  },
+
+    { map = "King's Castle", diff = "Insane",    minLvl = 70,  targetLvl = 75  },
+    { map = "King's Castle", diff = "Nightmare", minLvl = 75,  targetLvl = 80  },
+
+    { map = "The Underworld", diff = "Insane",    minLvl = 80,  targetLvl = 85  },
+    { map = "The Underworld", diff = "Nightmare", minLvl = 85,  targetLvl = 90  },
+
+    { map = "Samurai Palace", diff = "Insane",    minLvl = 90,  targetLvl = 95  },
+    { map = "Samurai Palace", diff = "Nightmare", minLvl = 95,  targetLvl = 100 },
+
+    { map = "The Canals", diff = "Insane",    minLvl = 100, targetLvl = 110 },
+    { map = "The Canals", diff = "Nightmare", minLvl = 110, targetLvl = 120 },
+
+    { map = "Steampunk Sewers", diff = "Insane",    minLvl = 120, targetLvl = 125 },
+    { map = "Steampunk Sewers", diff = "Nightmare", minLvl = 125, targetLvl = 140 },
+
+    { map = "Orbital Outpost", diff = "Insane",    minLvl = 140, targetLvl = 145 },
+    { map = "Orbital Outpost", diff = "Nightmare", minLvl = 145, targetLvl = 150 },
+
+    { map = "Volcanic Chambers", diff = "Insane",    minLvl = 150, targetLvl = 155 },
+    { map = "Volcanic Chambers", diff = "Nightmare", minLvl = 155, targetLvl = 160 },
+
+    { map = "Aquatic Temple", diff = "Insane",    minLvl = 160, targetLvl = 165 },
+    { map = "Aquatic Temple", diff = "Nightmare", minLvl = 165, targetLvl = 170 },
+
+    { map = "Enchanted Forest", diff = "Insane",    minLvl = 170, targetLvl = 175 },
+    { map = "Enchanted Forest", diff = "Nightmare", minLvl = 175, targetLvl = 180 },
+
+    { map = "Northern Lands", diff = "Insane",    minLvl = 180, targetLvl = 185 },
+    { map = "Northern Lands", diff = "Nightmare", minLvl = 185, targetLvl = 999 },
+}
+
+local SETTINGS_FILE = "AutoCarry_StageMaster.json"
+local currentStage = 1
+-- `currentStage` is the map shown to the host. A clone-derived stage is held
+-- separately and becomes visible only once the host has returned to lobby.
+local targetState = {
+    ready = false,
+    stageIndex = nil,
+    cloneLevel = nil,
+    cloneName = nil,
+    activeStageIndex = nil,
+    lastLiveAt = -math.huge,
+    revision = 0,
+}
+
+-- Pressing "Clear clone data" starts a fresh-batch discovery window. Existing
+-- players are ignored until a new clone explicitly sends a join request, so
+-- an old LV.170 clone still in the workspace cannot immediately steal stage 1.
+local batchDiscovery = {
+    active = false,
+    bootstrapAwaitingDungeon = false,
+    startWithoutLobbyClones = false,
+    candidates = {},
+}
+local clearCloneData = function() return false end
+local onCloneDataCleared = function() end
+
+local function saveStage()
+    pcall(function()
+        if writefile then writefile(SETTINGS_FILE, tostring(currentStage)) end
+    end)
+end
+
+local function loadStage()
+    pcall(function()
+        if isfile and isfile(SETTINGS_FILE) and readfile then
+            local val = tonumber(readfile(SETTINGS_FILE))
+            if val and val >= 1 and val <= #STAGES then
+                currentStage = val
+            else
+                currentStage = 1
+                saveStage()
+            end
+        end
+    end)
+end
+loadStage()
+
+local isHost = (string.lower(realPlayerName) == string.lower(HOST_NAME))
+
+-- Keep the last clone-derived stage across a lobby return or a teleport/reload.
+-- It is display/pending-lobby state only: `targetState.ready` still starts
+-- false and a live clone resolver remains the only authority that can start a
+-- room. This prevents the host UI from falling back to stage 1 while the
+-- clone's leaderstats are being recreated in the lobby.
+
+local function getLocalGold()
+    local leaderstats = localPlayer:FindFirstChild("leaderstats")
+    local valueObject = leaderstats and leaderstats:FindFirstChild("Gold")
+    local value = valueObject and tonumber(valueObject.Value)
+    return value or 0
+end
+
+local function getLocalLevel()
+    local leaderstats = localPlayer:FindFirstChild("leaderstats")
+    local valueObject = leaderstats and leaderstats:FindFirstChild("Level")
+    return (valueObject and tonumber(valueObject.Value)) or 0
+end
+
+local GAMEPASS_PRICE_HISTORY_FILE = "AutoCarry_GamepassPriceHistory.txt"
+local latestGamepassPrices = {}
+local refreshGamepassPricesForHistory = function() end
+local UI
+local GAMEPASS_HISTORY_ORDER = {
+    { id = "vip", label = "VIP" },
+    { id = "goldGamepass", label = "X2 Gold" },
+    { id = "extraItemGamepass", label = "+1 Item" },
+    { id = "freeStatResets", label = "Free Stat Resets" },
+}
+
+local function recordGamepassPriceHistory(reason)
+    if isHost then return false end
+    local level = getLocalLevel()
+    local lines = {
+        string.rep("-", 56),
+        string.format("Time: %s", os.date("%Y-%m-%d %H:%M:%S")),
+        string.format("Level: %d", level),
+        string.format("Reason: %s", tostring(reason or "Return to lobby")),
+    }
+    for _, item in ipairs(GAMEPASS_HISTORY_ORDER) do
+        local data = latestGamepassPrices[item.id]
+        table.insert(lines, string.format(
+            "%s | Price: %s | Owned: %s | Ready: %s",
+            item.label,
+            data and data.cost and tostring(data.cost) or "N/A",
+            tostring(data and data.owned == true),
+            tostring(data and data.ready == true)
+        ))
+    end
+    table.insert(lines, "")
+    local block = table.concat(lines, "\n") .. "\n"
+    local ok = pcall(function()
+        if appendfile then
+            appendfile(GAMEPASS_PRICE_HISTORY_FILE, block)
+        elseif writefile then
+            local previous = ""
+            if isfile and readfile and isfile(GAMEPASS_PRICE_HISTORY_FILE) then
+                previous = readfile(GAMEPASS_PRICE_HISTORY_FILE)
+            end
+            writefile(GAMEPASS_PRICE_HISTORY_FILE, previous .. block)
+        else
+            error("filesystem API unavailable")
+        end
+    end)
+    if UI then
+        UI.addLog(ok and "Gamepass price history saved" or "Unable to save gamepass price history", ok and "success" or "warn")
+    end
+    return ok
+end
+
+local function getDungeonProgress()
+    local progress = workspace:FindFirstChild("dungeonProgress")
+    if not progress then return nil end
+    local value = tostring(progress.Value)
+    local normalized = string.lower((value:match("^%s*(.-)%s*$")))
+    local compact = normalized:gsub("[%s_%-]", "")
+    if compact == "inprocess" or compact == "inprogress" then
+        return "in process"
+    end
+    if compact == "bosskilled" then
+        return "bosskilled"
+    end
+    return normalized
+end
+
+local function isInLobby()
+    -- PlaceManager from the supplied source maps the live lobby to this PlaceId.
+    -- Keep the replicated Lobby model as a compatibility signal for test builds.
+    if LOBBY_PLACE_IDS[game.PlaceId] then return true end
+    if DUNGEON_PLACE_IDS[game.PlaceId] then return false end
+    return workspace:FindFirstChild("Lobby") ~= nil
+end
+
+local function isDungeonBusy()
+    local progress = getDungeonProgress()
+    return progress == "in process" or progress == "bosskilled"
+end
+
+local function isInDungeon()
+    if isInLobby() then return false end
+    -- Dungeon Quest's Level place exposes these lifecycle values. Using them
+    -- avoids treating the teleport/loading gap as a fully initialized dungeon.
+    return DUNGEON_PLACE_IDS[game.PlaceId] == true
+        or workspace:FindFirstChild("dungeonProgress") ~= nil
+        or workspace:FindFirstChild("dungeonStarted") ~= nil
+        or workspace:FindFirstChild("start") ~= nil
+end
+
+local function isMatchStarted()
+    return isInDungeon()
+end
+
+local matchStartedTimestamp = isMatchStarted() and os.clock() or nil
+local matchCycle = {
+    forceNewMatch = false,
+    sawActiveProgress = false,
+    finishConsumed = false,
+}
+
+local function armNewMatchCycle()
+    matchCycle.forceNewMatch = true
+    matchCycle.sawActiveProgress = false
+    matchCycle.finishConsumed = false
+end
+
+local function observeMatchState()
+    local started = isInDungeon()
+    local entered = started and (matchStartedTimestamp == nil or matchCycle.forceNewMatch)
+    if entered then
+        matchStartedTimestamp = os.clock()
+        matchCycle.forceNewMatch = false
+        matchCycle.sawActiveProgress = false
+        matchCycle.finishConsumed = false
+    elseif not started then
+        matchStartedTimestamp = nil
+        matchCycle.sawActiveProgress = false
+        matchCycle.finishConsumed = false
+    end
+
+    local progress = getDungeonProgress()
+    if started and progress == "in process" then
+        matchCycle.sawActiveProgress = true
+        matchCycle.finishConsumed = false
+    end
+    return started, entered
+end
+
+local function isDungeonFinished()
+    local started = observeMatchState()
+    if not started then return false end
+
+    if matchCycle.finishConsumed then return false end
+    if getDungeonProgress() ~= "bosskilled" then return false end
+
+    matchCycle.finishConsumed = true
+    return true
+end
+
+local reportedRemoteProblems = {}
+local function reportRemoteProblem(name, message)
+    local key = name .. ":" .. message
+    if reportedRemoteProblems[key] then return end
+    reportedRemoteProblems[key] = true
+    warn(string.format("[AutoCarry] Remote %s: %s", name, message))
+end
+
+local function getRemote(name, expectedClass)
+    if not runtimeActive() then return nil end
+    if not remotes or not remotes.Parent then
+        remotes = ReplicatedStorage:FindFirstChild("remotes") or ReplicatedStorage:WaitForChild("remotes", 5)
+    end
+    local remote = remotes and (remotes:FindFirstChild(name) or remotes:WaitForChild(name, 2))
+    if not remote then
+        reportRemoteProblem(name, "not found")
+        return nil
+    end
+    if expectedClass and not remote:IsA(expectedClass) then
+        reportRemoteProblem(name, "unexpected class (" .. remote.ClassName .. ")")
+        return nil
+    end
+    return remote
+end
+
+local function fireRemote(name, ...)
+    local remote = getRemote(name, "RemoteEvent")
+    if not remote then return false end
+    local args = table.pack(...)
+    local ok, err = pcall(function()
+        remote:FireServer(table.unpack(args, 1, args.n))
+    end)
+    if not ok then reportRemoteProblem(name, tostring(err)) end
+    return ok
+end
+
+local function invokeRemote(name, ...)
+    local remote = getRemote(name, "RemoteFunction")
+    if not remote then return false, nil end
+    local args = table.pack(...)
+    local ok, result = pcall(function()
+        return remote:InvokeServer(table.unpack(args, 1, args.n))
+    end)
+    if not ok then reportRemoteProblem(name, tostring(result)) end
+    return ok, result
+end
+
+local AUTO_SELL_TYPES = {
+    { inventoryKey = "weapons", payloadKey = "weapon", label = "weapon" },
+    { inventoryKey = "chests", payloadKey = "chest", label = "chest" },
+    { inventoryKey = "helmets", payloadKey = "helmet", label = "helmet" },
+    { inventoryKey = "abilities", payloadKey = "ability", label = "ability" },
+}
+
+-- Never sell these abilities, irrespective of their level, rarity, or whether
+-- they are currently equipped.
+local PROTECTED_ABILITY_NAMES = {
+    ["enhanced inner focus"] = true,
+    ["enhanced inner range"] = true,
+    ["inner range"] = true,
+    ["inner focus"] = true,
+}
+
+local function isProtectedAbility(item)
+    local name = string.lower(tostring(item and item.name or "")):match("^%s*(.-)%s*$")
+    return PROTECTED_ABILITY_NAMES[name] == true
+end
+
+local autoSellRunning = false
+local lastAutoSellAt = -math.huge
+local autoSellBootAt = os.clock()
+local nextAutoSellAllowedAt = -math.huge
+
+local function getItemLevelReq(item)
+    return tonumber(item.levelReq) or 0
+end
+
+local function isInventoryItemEquipped(itemType, item)
+    if itemType ~= "ability" then
+        return item.equipped ~= false
+    end
+    local equipped = item.equipped
+    return typeof(equipped) == "table" and (equipped.q or equipped.e or equipped.q2 or equipped.e2) or false
+end
+
+local function getInventoryItemNumericId(key)
+    return tonumber(tostring(key):match("_(%d+)$"))
+end
+
+-- Dungeon Quest stores weapon and armor stats differently. Do not merge the
+-- fields: a Warrior needs Physical Damage on weapons and Physical Power on
+-- armor, while a Mage always needs Spell Power.
+local function warriorItemScore(item, itemType)
+    if itemType == "weapon" then
+        return tonumber(item.physicalDamage) or 0
+    end
+    return tonumber(item.physicalPower) or tonumber(item.physicalDamage) or 0
+end
+
+local function mageItemScore(item, _itemType)
+    return tonumber(item.spellPower) or 0
+end
+
+local function rarityScore(rarity)
+    local scores = { common = 1, uncommon = 2, rare = 3, epic = 4, legendary = 5, ultimate = 6 }
+    return scores[string.lower(tostring(rarity or ""))] or 0
+end
+
+local function isBetterBuildItem(candidate, candidateKey, current, currentKey, scoreFn, itemType)
+    if not current then return true end
+    local candidateScore, currentScore = scoreFn(candidate, itemType), scoreFn(current, itemType)
+    if candidateScore ~= currentScore then return candidateScore > currentScore end
+    local candidateLevel, currentLevel = getItemLevelReq(candidate), getItemLevelReq(current)
+    if candidateLevel ~= currentLevel then return candidateLevel > currentLevel end
+    local candidateUpgrade = tonumber(candidate.currentUpgrade) or 0
+    local currentUpgrade = tonumber(current.currentUpgrade) or 0
+    if candidateUpgrade ~= currentUpgrade then return candidateUpgrade > currentUpgrade end
+    local candidateRarity, currentRarity = rarityScore(candidate.rarity), rarityScore(current.rarity)
+    if candidateRarity ~= currentRarity then return candidateRarity > currentRarity end
+    return tostring(candidateKey) < tostring(currentKey)
+end
+
+local function getBestGearForBuild(bucket, itemType, scoreFn)
+    local bestItem, bestKey = nil, nil
+    local playerLevel = getLocalLevel()
+    if playerLevel <= 0 then playerLevel = math.huge end
+    for key, item in pairs(bucket or {}) do
+        local score = typeof(item) == "table" and scoreFn(item, itemType) or 0
+        if score > 0 and getItemLevelReq(item) <= playerLevel and isBetterBuildItem(item, key, bestItem, bestKey, scoreFn, itemType) then
+            bestItem, bestKey = item, key
+        end
+    end
+    return bestItem, bestKey
+end
+
+local function abilityMatchesBuild(item, build)
+    local description = string.lower(tostring(item.description or ""))
+    if build == "warrior" then
+        return string.find(description, "scales with physical damage", 1, true) ~= nil
+            or string.find(description, "scales with physical power", 1, true) ~= nil
+    end
+    return string.find(description, "scales with spell power", 1, true) ~= nil
+end
+
+local function isUniversalHeal(item)
+    return string.find(string.lower(tostring(item and item.name or "")), "universal heal", 1, true) ~= nil
+end
+
+local function getAutoLoadout(inventory)
+    local warriorGear, mageGear = {}, {}
+    local warriorTotal, mageTotal = 0, 0
+    local gearTypes = {
+        { singular = "weapon", plural = "weapons" },
+        { singular = "chest", plural = "chests" },
+        { singular = "helmet", plural = "helmets" },
+    }
+
+    for _, gearType in ipairs(gearTypes) do
+        local bucket = inventory[gearType.plural] or {}
+        local warriorItem, warriorKey = getBestGearForBuild(bucket, gearType.singular, warriorItemScore)
+        local mageItem, mageKey = getBestGearForBuild(bucket, gearType.singular, mageItemScore)
+        warriorGear[gearType.singular] = warriorItem and { item = warriorItem, key = warriorKey } or nil
+        mageGear[gearType.singular] = mageItem and { item = mageItem, key = mageKey } or nil
+        warriorTotal = warriorTotal + (warriorItem and warriorItemScore(warriorItem, gearType.singular) or 0)
+        mageTotal = mageTotal + (mageItem and mageItemScore(mageItem, gearType.singular) or 0)
+    end
+
+    local build = string.lower(tostring(CONFIG.AUTO_EQUIP_BUILD or "mage"))
+    if build ~= "warrior" and build ~= "mage" then build = "mage" end
+
+    local healCandidates, abilityCandidates = {}, {}
+    local playerLevel = getLocalLevel()
+    if playerLevel <= 0 then playerLevel = math.huge end
+    for key, item in pairs(inventory.abilities or {}) do
+        if typeof(item) == "table" and getItemLevelReq(item) <= playerLevel then
+            local entry = { item = item, key = key }
+            if not isHost and isUniversalHeal(item) then
+                table.insert(healCandidates, entry)
+            elseif abilityMatchesBuild(item, build) then
+                table.insert(abilityCandidates, entry)
+            end
+        end
+    end
+
+    local function sortAbilities(list)
+        table.sort(list, function(a, b)
+            local aLevel, bLevel = getItemLevelReq(a.item), getItemLevelReq(b.item)
+            if aLevel ~= bLevel then return aLevel > bLevel end
+            local aRarity, bRarity = rarityScore(a.item.rarity), rarityScore(b.item.rarity)
+            if aRarity ~= bRarity then return aRarity > bRarity end
+            return tostring(a.key) < tostring(b.key)
+        end)
+    end
+    sortAbilities(healCandidates)
+    sortAbilities(abilityCandidates)
+
+    local chosenAbilities, selectedKeys = {}, {}
+    local function addAbility(entry)
+        if not entry or selectedKeys[entry.key] or #chosenAbilities >= 4 then return end
+        selectedKeys[entry.key] = true
+        table.insert(chosenAbilities, entry)
+    end
+    for index = 1, math.min(2, #healCandidates) do addAbility(healCandidates[index]) end
+    for _, entry in ipairs(abilityCandidates) do addAbility(entry) end
+
+    return {
+        build = build,
+        gear = build == "warrior" and warriorGear or mageGear,
+        warriorTotal = warriorTotal,
+        mageTotal = mageTotal,
+        abilities = chosenAbilities,
+    }
+end
+
+local function makeLoadoutReservation(loadout)
+    local reserved = { weapons = {}, chests = {}, helmets = {}, abilities = {} }
+    for singular, entry in pairs(loadout.gear) do
+        if entry then
+            reserved[singular .. "s"][entry.key] = true
+        end
+    end
+    for _, entry in ipairs(loadout.abilities) do
+        reserved.abilities[entry.key] = true
+    end
+    return reserved
+end
